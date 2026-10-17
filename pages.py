@@ -288,7 +288,7 @@ def node_authors(node, title="", facts=None):
                 if kind in {"Article", "BlogPosting", "NewsArticle", "Review"}:
                     return False  # Creator of the enclosing publication, not its subject book.
         if not title:
-            return True
+            return fact_role(element, node) != "secondary"
         state, owner, _ = content_owner(element, node, title, check_context=check_context)
         own_heading = local_heading(node)
         # A separately headed nested card supplies its own author, not its parent's.
@@ -402,7 +402,7 @@ def region_role(node):
     label = heading.get_text(" ", strip=True) if heading else ""
     if node.name in {"p", "li"} or re.fullmatch(r"h[1-6]", node.name or ""):
         label = node.get_text(" ", strip=True)
-    if re.search(r"(?:^|[-_\s])(?:user|profile|review\w*|comment\w*|advert\w*|ads|recommend\w*|related|bibliography)(?:$|[-_\s])",
+    if re.search(r"(?:^|[-_\s])(?:user|profile|review\w*|ratings?|comment\w*|advert\w*|ads|recommend\w*|related|bibliography)(?:$|[-_\s])",
                  marker, re.I) or re.match(
         r"\s*(?:реклам\w*|рекоменду\w*|рекомендации|другие книги|также прочита\w*|"
         r"advert\w*|recommend\w*|suggested reading|reader account|user profile|reviews?|comments?)\b", label, re.I):
