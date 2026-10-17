@@ -80,6 +80,7 @@ def test_import_and_export_preserve_values_and_physical_rows(tmp_path):
     write_workbook(analysis, output)
     workbook = openpyxl.load_workbook(output)
     sheet = workbook["Normalized"]
+    assert sheet["A1"].value == "Правообладатель"
     assert tuple(sheet.cell(2, column).value for column in range(1, 7)) == original
     assert sheet.cell(2, 7).value == 2
     assert sheet.cell(3, 7).value == 4

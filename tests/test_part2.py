@@ -129,6 +129,7 @@ def test_successful_but_empty_http_response_is_not_negative(catalog):
     assert result["status"] == 2
     assert result["match"]["state"] == "unavailable"
     assert result["evidence"]
+    assert "Проблемы извлечения: not_loaded" in result["evidence"]
 
 
 @pytest.mark.parametrize(("old", "new", "code"), [

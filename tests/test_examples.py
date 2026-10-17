@@ -17,6 +17,7 @@ def test_offline_example_reproduces_statuses(tmp_path, mode):
     run(tmp_path, mode)
     records = [json.loads(line) for line in (tmp_path / "part2_results.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [r["status"] for r in records] == [1, 0, 2, 1, 0, 2, 1 if mode == "auto" else 2]
+    assert all(item.strip() != "Проблемы извлечения:" for record in records for item in record["evidence"])
     assert (tmp_path / "part1_processed.xlsx").is_file()
     assert (tmp_path / "part2_results.xlsx").is_file()
     assert all(r["url"].startswith("https://library.example/") for r in records)

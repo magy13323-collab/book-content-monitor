@@ -337,8 +337,9 @@ def complete_evidence(result):
         result["evidence"] = [
             f"HTTP {result['http_status']}; ответ {result['response_bytes']} байт; "
             f"извлечено {result['extracted']['text_chars']} символов.",
-            "Проблемы извлечения: " + ", ".join(result["extracted"]["issues"]),
         ]
+        if result["extracted"]["issues"]:
+            result["evidence"].append("Проблемы извлечения: " + ", ".join(result["extracted"]["issues"]))
     result["evidence"] = list(dict.fromkeys(result["evidence"]))
     return result
 
