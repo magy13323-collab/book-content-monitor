@@ -1,0 +1,4 @@
+-r requirements.txt
+playwright==1.64.0
+pyee==14.0.0
+greenlet==3.5.6

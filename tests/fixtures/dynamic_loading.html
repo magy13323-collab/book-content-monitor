@@ -1,0 +1,6 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Загрузка — Библиотека</title></head>
+<body><main><h1>Загрузка</h1><p>Секундочку… Страница откроется автоматически.
+Для продолжения включите JavaScript и подождите.</p></main>
+<script>setTimeout(() => fetch('/resolved').then(r => r.text()).then(html => {
+  document.open(); document.write(html); document.close();
+}), 150);</script></body></html>
