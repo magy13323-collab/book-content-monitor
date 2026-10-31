@@ -16,7 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-HEADERS = ("Праообладатель", "Автор", "Название", "Тип контента", "url", "Сайт")
+HEADERS = ("Правообладатель", "Автор", "Название", "Тип контента", "url", "Сайт")
 PUNCTUATION = str.maketrans({
     "«": '"', "»": '"', "“": '"', "”": '"', "„": '"',
     "‘": "'", "’": "'", "‐": "-", "‑": "-", "–": "-", "—": "-", "−": "-",
@@ -319,7 +319,7 @@ def process_workbook(source):
     try:
         sheet = workbook.worksheets[0]
         headers = tuple(cell.value for cell in next(sheet.iter_rows(max_row=1, max_col=6)))
-        if headers not in {HEADERS, ("Правообладатель",) + HEADERS[1:]}:
+        if headers not in {HEADERS, ("Праообладатель",) + HEADERS[1:]}:
             raise ValueError(f"Неожиданные заголовки первого листа: {headers!r}")
         for row_number, values in enumerate(sheet.iter_rows(min_row=2, max_col=6, values_only=True), 2):
             if all(value is None for value in values):

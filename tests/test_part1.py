@@ -13,12 +13,12 @@ HEADERS = ["Праообладатель", "Автор", "Название", "Т
 SOURCE = Path(__file__).resolve().parents[1] / "examples" / "synthetic_input.xlsx"
 
 
-def make_source(tmp_path, rows):
+def make_source(tmp_path, rows, first_header="Праообладатель"):
     path = tmp_path / "input.xlsx"
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = "Исходные данные"
-    sheet.append(HEADERS)
+    sheet.append([first_header] + HEADERS[1:])
     for row in rows:
         sheet.append(row)
     workbook.create_sheet("Другой лист").append(["Не обрабатывать"])
@@ -67,19 +67,27 @@ def test_url_normalization_preserves_resource_identity(value, expected):
     assert normalize_url(normalize_url(value)) == expected
 
 
-def test_import_and_export_preserve_values_and_physical_rows(tmp_path):
+@pytest.mark.parametrize("first_header", ["Праообладатель", "Правообладатель"])
+def test_import_and_export_preserve_values_and_physical_rows(tmp_path, first_header):
     original = row("  Ёж; ", " ;Книга «А» ", "https://EXAMPLE.org/Book?t=1")
-    source = make_source(tmp_path, [original, (None,) * 6, row(title="Другая книга")])
+    source = make_source(tmp_path, [original, (None,) * 6, row(title="Другая книга")], first_header)
     before = hashlib.sha256(source.read_bytes()).digest()
     analysis = process_workbook(source)
     assert len(analysis.records) == 2
     assert [record.source_row for record in analysis.records] == [2, 4]
     assert analysis.records[0].raw == original
     assert analysis.records[0].source_sheet == "Исходные данные"
+    assert [record.record_group_id for record in analysis.records] == [
+        "record_b99aa4506da5bf0e", "record_b367513da24c57c9"]
+    assert [record.url_group_id for record in analysis.records] == [
+        "url_26c9f29d190bb17e", "url_5c00ef68673d8b0b"]
+    assert [record.book_id for record in analysis.records] == [
+        "book_69c3ce748670d636", "book_9d29f8f07d29bdb9"]
     output = tmp_path / "processed.xlsx"
     write_workbook(analysis, output)
     workbook = openpyxl.load_workbook(output)
     sheet = workbook["Normalized"]
+    assert tuple(cell.value for cell in sheet[1][:6]) == ("Правообладатель",) + tuple(HEADERS[1:])
     assert tuple(sheet.cell(2, column).value for column in range(1, 7)) == original
     assert sheet.cell(2, 7).value == 2
     assert sheet.cell(3, 7).value == 4
@@ -87,6 +95,26 @@ def test_import_and_export_preserve_values_and_physical_rows(tmp_path):
     assert all(sheet.auto_filter.ref and sheet.freeze_panes == "A2" for sheet in workbook)
     workbook.close()
     assert hashlib.sha256(source.read_bytes()).digest() == before
+
+
+@pytest.mark.parametrize("first_header", ["Праообладатель", "Правообладатель"])
+def test_missing_rightsholder_uses_correct_name_in_review(tmp_path, first_header):
+    original = (None,) + row()[1:]
+    source = make_source(tmp_path, [original], first_header)
+    before = source.read_bytes()
+    analysis = process_workbook(source)
+    assert analysis.records[0].raw == original
+    assert analysis.records[0].source_row == 2
+    missing = [item for item in analysis.review if item["code"] == "missing_required"]
+    assert [item["reason"] for item in missing] == ["Не заполнены поля: Правообладатель"]
+    output = tmp_path / "processed.xlsx"
+    write_workbook(analysis, output)
+    workbook = openpyxl.load_workbook(output)
+    assert workbook["Normalized"]["A1"].value == "Правообладатель"
+    assert tuple(cell.value for cell in workbook["Normalized"][2][:6]) == original
+    assert workbook["Review"]["D2"].value == "Не заполнены поля: Правообладатель"
+    workbook.close()
+    assert source.read_bytes() == before
 
 
 def test_full_duplicates_and_url_conflicts_are_different(tmp_path):
