@@ -6,14 +6,14 @@ from itertools import islice
 import json
 import re
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from pypdf import PdfReader, PageObject
 from pypdf.errors import PdfReadError
 import requests
 
-from part1 import normalize_text, valid_url
+from part1 import normalize_identity, normalize_text, valid_url
 
 
 @dataclass(frozen=True)
@@ -227,7 +227,117 @@ def compact(text):
 
 
 def text_key(text):
-    return " ".join(re.findall(r"[^\W_]+", normalize_text(text)))
+    words = re.findall(r"[^\W_]+|[+#]+", normalize_identity(text))
+    # Spaced suffixes such as C ++ and C # retain the same identity as C++ and C#.
+    return re.sub(r"\s+([+#])", r"\1", " ".join(words))
+
+
+VOLUME_NUMBER = re.compile(r"\b(том|книга|часть|ч|volume|vol|book|part)\b[\s._-]+"
+                           r"(?:no\.?\s*)?(\d+|[ivxlcdm]+)(?![\w+#]|\s*[+#])", re.I)
+VOLUME_LABELS = {"том": "volume", "volume": "volume", "vol": "volume",
+                 "книга": "book", "book": "book", "часть": "part", "ч": "part", "part": "part"}
+
+
+def number_value(number):
+    if number.isdigit():
+        return int(number)
+    total, previous = 0, 0
+    for character in reversed(number):
+        value = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}[character]
+        total += -value if value < previous else value
+        previous = max(previous, value)
+    return total
+
+
+def canonical_volume_title(title):
+    """Comparison only: never use this key to generate catalogue IDs."""
+    def replace(match):
+        number = match[2]
+        if not number.isdigit() and not re.fullmatch(
+            r"m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})", number
+        ):
+            return match[0]
+        return match[1] + " " + str(number_value(number))
+
+    # NFKC expands № into No; keep its boundary even in 'Том№13'.
+    value = "" if title is None else str(title)
+    return VOLUME_NUMBER.sub(replace, normalize_identity(value.replace("№", " No ")))
+
+
+def title_key(title):
+    return text_key(canonical_volume_title(title))
+
+
+def _volume_items(title):
+    for match in VOLUME_NUMBER.finditer(canonical_volume_title(title)):
+        if match[2].isdigit():
+            yield VOLUME_LABELS[match[1]], int(match[2])
+
+
+def volume_markers(title):
+    return dict(_volume_items(title))
+
+
+def volume_conflict(expected, observed):
+    first, second = list(_volume_items(expected)), list(_volume_items(observed))
+    return any(key == other and value != number for key, value in first for other, number in second)
+
+
+def title_punctuation_conflict(title, observed):
+    """Compare internal punctuation in aligned title words, not presentation wrappers."""
+    def parts(value):
+        value = canonical_volume_title(value)
+        tokens = list(re.finditer(r"[^\W_]+(?:\s*[+#])*|[+#]+", value))
+        words = [text_key(token[0]) for token in tokens]
+        gaps = [re.sub(r"[\s\"']", "", value[first.end():second.start()])
+                for first, second in zip(tokens, tokens[1:])]
+        # Leave the existing volume-marker formatting rules to their own matcher.
+        for index in range(len(words) - 1):
+            if words[index] in {"том", "книга", "часть", "ч", "volume", "vol", "book", "part"} and re.fullmatch(
+                r"\d+|[ivxlcdm]+", words[index + 1]):
+                if "|" not in gaps[index]:
+                    gaps[index] = ""
+                if index and "|" not in gaps[index - 1]:
+                    gaps[index - 1] = ""
+        pipes = ([value[:tokens[0].start()].count("|")] + [gap.count("|") for gap in gaps]
+                 + [value[tokens[-1].end():].count("|")]) if tokens else [value.count("|")]
+        return words, gaps, pipes
+
+    expected, punctuation, expected_pipes = parts(title)
+    words, gaps, pipes = parts(observed)
+    candidates = [(gaps[index:index + len(expected) - 1], pipes[index:index + len(expected) + 1])
+                  for index in range(len(words) - len(expected) + 1)
+                  if expected and words[index:index + len(expected)] == expected]
+    for candidate, observed_pipes in candidates:
+        if expected_pipes != observed_pipes:
+            continue
+        first, second = punctuation, candidate
+        # Preserve the existing optional subtitle-dash tolerance. If both titles
+        # contain a dash, its position still participates in the comparison.
+        if not any("-" in gap for gap in first) or not any("-" in gap for gap in second):
+            first, second = ([gap.replace("-", "") for gap in first],
+                             [gap.replace("-", "") for gap in second])
+        if first == second:
+            return False
+    return bool(candidates)
+
+
+def authors_match(expected, observed):
+    """Compare complete author sets; only semicolons explicitly separate names."""
+    def names(values):
+        result = set()
+        for value in values:
+            for author in value.split(";"):
+                words = text_key(author).split()
+                if not words:
+                    return set()  # Do not silently drop a malformed list member.
+                if all(len(word) > 1 for word in words):
+                    words.sort()  # Full names may be surname-first; initials may not.
+                result.add(tuple(words))
+        return result
+
+    first, second = names(expected), names(observed)
+    return bool(first) and first == second
 
 
 @dataclass
@@ -250,12 +360,26 @@ class Page:
     partial: bool = False
     interaction_hints: list = field(default_factory=list)
     detected_formats: list = field(default_factory=list)
+    issue_scopes: dict = field(default_factory=dict)  # Internal provenance; summary schema stays unchanged.
+
+    def issue_applies(self, issue, subject=None):
+        scopes = self.issue_scopes.get(issue, [])
+        if (not scopes or len(scopes) != self.issues.count(issue) or not subject
+            or issue in self.blocking_issues):
+            return True
+        return any(not (
+            scope.get("scope_is_book") and subject.get("scope_is_book")
+            and scope.get("scope_id") is not None and subject.get("scope_id") is not None
+            and scope["scope_id"] != subject["scope_id"]
+            and scope["scope_id"] not in subject.get("scope_ancestors", [])
+            and subject["scope_id"] not in scope.get("scope_ancestors", [])
+        ) for scope in scopes)
 
     def summary(self):
         return {
             "kind": self.kind, "title": self.title[:400], "h1": self.h1[:5],
-            "authors": self.authors[:10], "metadata": self.metadata,
-            "subjects": [{"title": item["title"][:400], "authors": item["authors"][:10],
+            "authors": self.authors[:], "metadata": self.metadata,
+            "subjects": [{"title": item["title"][:400], "authors": item["authors"][:],
                           "source": item["source"], "scope": item["scope"],
                           "author_facts": item.get("author_facts", [])}
                          for item in self.subjects[:30]],
@@ -288,7 +412,7 @@ def node_authors(node, title="", facts=None):
                 if kind in {"Article", "BlogPosting", "NewsArticle", "Review"}:
                     return False  # Creator of the enclosing publication, not its subject book.
         if not title:
-            return fact_role(element, node) != "secondary"
+            return True
         state, owner, _ = content_owner(element, node, title, check_context=check_context)
         own_heading = local_heading(node)
         # A separately headed nested card supplies its own author, not its parent's.
@@ -314,13 +438,13 @@ def node_authors(node, title="", facts=None):
             continue
         value = compact(container.get_text(" ", strip=True))
         value = re.sub(r"^" + author_label, "", value, flags=re.I)
-        if 2 <= len(value) <= 100:
+        if len(value) >= 2:
             authors.append(value)
     for element in node.find_all(string=re.compile(author_label, re.I)):
         if not local(element.parent):
             continue
         line = str(element).strip()
-        found = re.search(author_label + r"(.{2,100})$", line, re.I)
+        found = re.search(author_label + r"(.{2,})$", line, re.I)
         if found:
             authors.append(found[1])
     role = "book_author" if book_authors else "labelled_author"
@@ -337,16 +461,38 @@ def node_authors(node, title="", facts=None):
     if not authors:
         role = "bibliographic_panel"
         authors = panel_authors
-    authors = unique(re.sub(r"^" + author_label, "", value, flags=re.I) for value in authors)[:10]
+    # Compare the whole set; document loading limits bound the input, not author count.
+    authors = unique(re.sub(r"^" + author_label, "", value, flags=re.I) for value in authors)
     if facts is not None:
         facts.extend({"name": author, "role": role, "scope_locator": dom_locator(node)} for author in authors)
     return authors
 
 
 def identity_heading(title):
-    key = text_key(title)
+    key = title_key(title)
     key = re.sub(r"^(?:(?:читать|скачать|слушать|книгу|аудиокнига|бесплатно|онлайн)\s+)+", "", key)
     return re.sub(r"(?:\s+(?:полностью|онлайн|бесплатно|слушать))+$", "", key)
+
+
+def title_byline_role(title, expected, authors):
+    """Recognize an edge byline, never delete arbitrary names inside a title."""
+    def same_title(value):
+        return (identity_heading(value) == identity_heading(expected)
+                and not title_punctuation_conflict(expected, value))
+
+    # A dash signature still needs an independent title (e.g. primary Book JSON-LD).
+    parts = re.split(r"\s+-\s+", normalize_identity(title))
+    if len(parts) == 2:
+        for name, value in (parts, (parts[1], parts[0])):
+            if same_title(value) and authors_match(authors, [name]):
+                return "signature"
+    # Preserve the established complete, explicitly delimited coauthor-list form.
+    for boundary in re.finditer(r"\s+", title):
+        left, right = title[:boundary.start()], title[boundary.end():]
+        for name, value in ((left, right), (right, left)):
+            if ";" in name and same_title(value) and authors_match(authors, [name]):
+                return "author_list"
+    return ""
 
 
 def service_heading(title):
@@ -402,7 +548,7 @@ def region_role(node):
     label = heading.get_text(" ", strip=True) if heading else ""
     if node.name in {"p", "li"} or re.fullmatch(r"h[1-6]", node.name or ""):
         label = node.get_text(" ", strip=True)
-    if re.search(r"(?:^|[-_\s])(?:user|profile|review\w*|ratings?|comment\w*|advert\w*|ads|recommend\w*|related|bibliography)(?:$|[-_\s])",
+    if re.search(r"(?:^|[-_\s])(?:user|profile|review\w*|comment\w*|advert\w*|ads|recommend\w*|related|bibliography)(?:$|[-_\s])",
                  marker, re.I) or re.match(
         r"\s*(?:реклам\w*|рекоменду\w*|рекомендации|другие книги|также прочита\w*|"
         r"advert\w*|recommend\w*|suggested reading|reader account|user profile|reviews?|comments?)\b", label, re.I):
@@ -462,10 +608,15 @@ def content_owner(element, root, title, check_context=False, authors=()):
             if heading_branch is not branch and (book_boundary(heading_branch) or
                 compact(heading_branch.get_text(" ", strip=True)) != heading_text):
                 heading_text = ""
-        if any(text_key(heading_text) in {text_key(author), " ".join(reversed(text_key(author).split()))} for author in authors):
+        if (identity_heading(heading_text) != expected and any(text_key(heading_text) in {
+            text_key(author), " ".join(reversed(text_key(author).split()))} for author in authors)):
             heading_text = ""
         if heading_text and not service_heading(heading_text):
+            if title_punctuation_conflict(title, heading_text):
+                return "unresolved", current, "Пунктуация заголовка отличается; принадлежность требует подтверждения."
             if identity_heading(heading_text) != expected:
+                if normalize_text(identity_heading(heading_text)) == normalize_text(expected):
+                    return "unresolved", current, "Заголовок отличается е/ё; принадлежность требует подтверждения."
                 return "other_scope", current, "Другой заголовок области: " + heading_text[:150]
             if owner is root:
                 owner = current
@@ -489,7 +640,7 @@ def content_owner(element, root, title, check_context=False, authors=()):
             if (current.name == "p" and native_download and current.parent is not root
                 and local_heading(current.parent) is None):
                 bibliography = compact(current.parent.get_text(" ", strip=True))
-            bibliographic_context = (f" {expected} " in f" {text_key(bibliography)} " and any(
+            bibliographic_context = (f" {expected} " in f" {title_key(bibliography)} " and any(
                 re.search(r"\b(?:автор|author)\s*:\s*" + re.escape(author), bibliography, re.I) for author in authors))
             for child in current.children:
                 if child is branch or not getattr(child, "name", None):
@@ -515,15 +666,17 @@ def content_owner(element, root, title, check_context=False, authors=()):
                 # even when the publisher has not labelled the block as advertising.
                 separate_card = local_heading(sibling) is not None and sibling.select_one('a[href], audio, [itemprop="text"]')
                 peer_authors = [] if separate_card else node_authors(sibling)
-                peer_text = text_key(sibling.get_text(" ", strip=True))
+                peer_text = title_key(sibling.get_text(" ", strip=True))
                 # An inline title/byline is a bibliographic relationship regardless
                 # of the publisher's prose prefix or CSS vocabulary.
-                byline = re.search(r"\bby\s+(.{2,100})$", compact(sibling.get_text(" ", strip=True)), re.I)
+                byline = re.search(r"\bby\s+(.{2,})$", compact(sibling.get_text(" ", strip=True)), re.I)
                 if not separate_card and byline:
                     peer_authors = unique(peer_authors + [byline[1]])
                 labelled_byline = re.match(AUTHOR_LABEL, sibling.get_text(" ", strip=True), re.I)
-                if peer_authors and (not any(sorted(text_key(author).split()) == sorted(text_key(peer).split())
-                                            for author in authors for peer in peer_authors)
+                # A labelled row may name one coauthor; an independent bibliography must name all.
+                if peer_authors and (not (authors_match(authors, peer_authors) or (
+                    labelled_byline and any(authors_match([author], [peer])
+                                            for author in authors for peer in peer_authors)))
                                      or (f" {expected} " not in f" {peer_text} " and not labelled_byline)):
                     return "unresolved", sibling, "Соседний библиографический блок не подтверждает идентичность этой книги."
             if getattr(sibling, "name", None) not in {"h1", "h2", "h3", "h4", "h5", "h6", "header"}:
@@ -532,11 +685,16 @@ def content_owner(element, root, title, check_context=False, authors=()):
             if sibling_heading is None:
                 continue
             heading_text = compact(sibling_heading.get_text(" ", strip=True))
-            if any(text_key(heading_text) in {text_key(author), " ".join(reversed(text_key(author).split()))} for author in authors):
+            if (identity_heading(heading_text) != expected and any(text_key(heading_text) in {
+                text_key(author), " ".join(reversed(text_key(author).split()))} for author in authors)):
                 continue
             if service_heading(heading_text):
                 continue
+            if title_punctuation_conflict(title, heading_text):
+                return "unresolved", current.parent, "Пунктуация предшествующего заголовка не подтверждает принадлежность."
             if identity_heading(heading_text) != expected:
+                if normalize_text(identity_heading(heading_text)) == normalize_text(expected):
+                    return "unresolved", current.parent, "Предшествующий заголовок отличается е/ё; принадлежность не подтверждена."
                 return "other_scope", current.parent, "Предшествующий заголовок другой области: " + heading_text[:150]
             break
         branch, current = current, current.parent
@@ -545,16 +703,16 @@ def content_owner(element, root, title, check_context=False, authors=()):
 
 def resource_label_matches(label, title):
     """Action-only labels inherit the local card; descriptive labels need its actual title."""
-    label_key = text_key(label)
+    label_key = title_key(label)
     label_key = re.sub(r"\s+\d+(?:\s+\d+)?\s+(?:кб|мб|kb|mb)$", "", label_key)
     if not label_key:
         return False
-    title_key = identity_heading(title)
-    remainder = (" " + label_key + " ").replace(" " + title_key + " ", " ").strip()
+    expected = identity_heading(title)
+    remainder = (" " + label_key + " ").replace(" " + expected + " ", " ").strip()
     return bool(re.fullmatch(
         r"(?:(?:скачать|загрузить|читать|слушать|книга|книгу|бесплатно|онлайн|"
         r"download|read|listen|online|book|epub|fb2|pdf|mobi|azw3|djvu|txt|rtf|docx|torrent|zip|mp3|m4a|ogg|wav)\s*)*",
-        remainder))
+        remainder)) and not title_punctuation_conflict(title, label)
 
 
 def link_labels(link):
@@ -579,12 +737,77 @@ def action_link_kind(link, href):
     return ""
 
 
+def _reader_is_commentary(reader, root):
+    """Explicit commentary roles outweigh a reader-like container and text length."""
+    for region in [reader, *reader.parents]:
+        marker = " ".join([str(region.get("id", "")), " ".join(region.get("class", [])),
+                           str(region.get("itemprop", "")), str(region.get("itemtype", ""))])
+        if re.search(r"(?:^|[-_\s/])(?:reviews?|reviewBody|annotation|description|synopsis|critique)(?:$|[-_\s/])",
+                     marker, re.I):
+            return True
+        if region is root:
+            break  # The book's own title is not a label of the nested text's role.
+        heading = local_heading(region)
+        label = heading.get_text(" ", strip=True) if heading else ""
+        if region is reader and not label:
+            label = next(reader.stripped_strings, "")
+        if re.match(r"\s*(?:рецензия|отзыв|аннотация|критический\s+(?:обзор|разбор|анализ)|"
+                    r"(?:book\s+)?review|synopsis|annotation|critical\s+(?:review|analysis))\b", label, re.I):
+            return True
+    return False
+
+
+def _file_link_issue(element, owner, document_url, resource_url, title, authors):
+    """Contradictory book hints leave a file unresolved; storage IDs are independent."""
+    source, target = urlsplit(document_url), urlsplit(resource_url)
+
+    def book_ids(url):
+        return set(re.findall(r"/(?:books?|knigi|kniga)[-_/](\d+)(?=/|$|\.html?$)", url.path, re.I)) | {
+            value for key in ("book_id", "bookid") for value in parse_qs(url.query).get(key, [])}
+
+    current = element
+    while owner.get("data-book-id") and current is not None and current is not owner:
+        if current.get("data-book-id") and owner["data-book-id"] != current["data-book-id"]:
+            return "Заявленный data-book-id файла противоречит карточке книги."
+        current = current.parent
+    if source.netloc.casefold() == target.netloc.casefold():
+        first, second = book_ids(source), book_ids(target)
+        if first and second and first != second:
+            return "Адрес файла указывает другой ID книги на том же сайте; принадлежность файла не подтверждена."
+    own_words = set(title_key(title).split() + text_key(" ".join(authors)).split()) | {"book", "ebook", "file", "download"}
+    title_words = {word for word in identity_heading(title).split()
+                   if len(word) > 2 and word not in {"the", "and", "for"}}
+    names = [unquote(target.path.rsplit("/", 1)[-1]), str(element.get("download", ""))]
+    for name in names:
+        stem = name.rsplit(".", 1)[0]
+        if re.fullmatch(r"[a-f\d_-]{16,}", stem, re.I):
+            continue  # A hash/UUID is an object identifier, not a bibliographic title.
+        stem = stem.replace("_", " ")
+        if volume_conflict(title, stem):
+            return "Номер тома/части/книги в имени файла противоречит карточке: " + name[:120]
+        name_key, expected = identity_heading(stem), identity_heading(title)
+        if name_key != expected and normalize_text(name_key) == normalize_text(expected):
+            return "Имя файла отличается е/ё; принадлежность этой книге не подтверждена: " + name[:120]
+        words = {word for word in title_key(stem).split() if word.isalpha() and len(word) > 1}
+        # A partial filename may abbreviate the title; a foreign name or an extended
+        # complete title cannot establish ownership merely through a shared word.
+        if (len(words) >= 2 and not words <= own_words
+            and (not words & title_words or title_words <= words)):
+            return "Описательное имя файла не подтверждает его принадлежность этой книге: " + name[:120]
+    return ""
+
+
 def content_signals(node, base_url, title="", audio_claim=False, authors=(), resource_base=None):
     """Keep observed signals, but explicitly distinguish bound, foreign and unresolved ownership."""
     signals = []
+    unverified_signals = []
 
-    def add(element, signal):
+    def add(element, signal, unverified=""):
         binding, owner, reason = content_owner(element, node, title, check_context=True, authors=authors)
+        role = fact_role(element, node)
+        if signal["kind"] == "reader_text" and _reader_is_commentary(element, node):
+            binding, role = "other_scope", "secondary"
+            reason = "Блок обозначен как рецензия, аннотация или критический обзор, а не текст произведения."
         owner_authors = node_authors(owner, title) if binding == "bound" else []
         if binding == "bound" and not owner_authors:
             for heading in owner.find_all(["h2", "h3"]):
@@ -593,9 +816,12 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
                 if (previous and identity_heading(previous.get_text()) == identity_heading(title)
                     and any(text_key(value) in {text_key(author), " ".join(reversed(text_key(author).split()))} for author in authors)):
                     owner_authors.append(value)
-        name_keys = lambda values: {tuple(sorted(text_key(value).split())) for value in values}
-        if binding == "bound" and authors and owner_authors and not (name_keys(authors) & name_keys(owner_authors)):
-            binding, reason = "other_scope", "Автор области не совпадает с автором основной карточки."
+        if binding == "bound" and authors and owner_authors and not authors_match(authors, owner_authors):
+            if authors_match([a.replace("ё", "е").replace("Ё", "Е") for a in authors],
+                             [a.replace("ё", "е").replace("Ё", "Е") for a in owner_authors]):
+                binding, reason = "unresolved", "Имя автора области отличается е/ё; идентичность не подтверждена."
+            else:
+                binding, reason = "other_scope", "Автор области не совпадает с автором основной карточки."
         if binding == "bound" and signal["kind"] in {"file_link", "reading_link", "download_link"}:
             labels = link_labels(element)
             labels = [label for label in labels if not re.fullmatch(r"(?:Скачиваний|Downloads)\s*:\s*\d*", label, re.I)]
@@ -607,6 +833,11 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
                 target_ids = re.findall(r"(?:^|[-_/])(\d{4,})(?=[-_/\.]|$)", urlsplit(signal["url"]).path)
                 if source_ids and target_ids and not set(source_ids) & set(target_ids):
                     binding, reason = "unresolved", "Идентификатор адреса действия отличается от карточки книги."
+        if binding == "bound" and signal["kind"] == "file_link":
+            issue = _file_link_issue(element, owner, base_url,
+                                     urljoin(resource_base or base_url, element["href"]), title, authors)
+            if issue:
+                binding, reason = "unresolved", issue
         if binding == "bound" and signal["kind"] == "audio_source":
             audio = element if element.name == "audio" else element.parent
             label = audio.get("title") or audio.get("aria-label")
@@ -614,14 +845,24 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
             context = compact(previous.get_text(" ", strip=True)) if previous else ""
             contextual_audio = bool(re.search(r"аудиокниг|аудиоверси|audiobook", context, re.I))
             explicit_card = book_boundary(owner)
-            named_audio = bool(label and f" {identity_heading(title)} " in f" {text_key(label)} ")
+            named_audio = bool(label and f" {identity_heading(title)} " in f" {title_key(label)} ")
             if (label and not resource_label_matches(label, title)) or not (
                 named_audio or explicit_card or audio_claim or contextual_audio
             ):
                 binding, reason = "unresolved", "Плеер не связан с книгой подписью, карточкой или контекстом аудиоверсии."
-        signals.append({**signal, "binding": binding, "scope_title": title if binding == "bound" else "",
-                        "document_url": base_url, "raw_resource": element.get("href", element.get("src", "")),
-                        "semantic_role": fact_role(element, node),
+        if signal["kind"] == "embedded_document":
+            label = element.get("title") or element.get("aria-label", "")
+            if label and not resource_label_matches(label, title) and not re.fullmatch(
+                r"(?:book reader|reader|читалка|текст книги|book text|pdf(?: document)?|документ pdf)", label, re.I):
+                binding, reason = "other_scope", "Подпись встроенного документа относится к другой области: " + label[:150]
+        if unverified:
+            if role == "secondary" or _reader_is_commentary(element, node):
+                binding = "other_scope"
+            elif binding == "bound":
+                binding, reason = "unresolved", unverified
+        (unverified_signals if unverified else signals).append({**signal, "binding": binding, "scope_title": title if binding == "bound" else "",
+                        "document_url": base_url, "raw_resource": element.get("href", element.get("src", element.get("data", ""))),
+                        "semantic_role": role,
                         "scope_authors": owner_authors,
                         "scope_locator": dom_locator(owner), "element_locator": dom_locator(element),
                         "binding_reason": reason})
@@ -632,8 +873,9 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
             continue
         label = " ".join(link_labels(link))
         filename = str(link.get("download", ""))
+        # A fragment does not identify a fetched file. Keep query handling unchanged.
         extension = re.search(r"\.(epub|fb2|pdf|mobi|azw3|djvu|txt|rtf|docx|torrent|zip|mp3|m4a|ogg|wav)(?:$|[?#])",
-                              href, re.I)
+                              href.split("#", 1)[0], re.I)
         if not extension and filename:
             extension = re.search(r"\.(epub|fb2|pdf|mobi|azw3|djvu|txt|rtf|docx|zip|mp3|m4a|ogg|wav)$", filename, re.I)
         if extension:
@@ -653,12 +895,47 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
         if valid_url(href):
             add(audio, {"kind": "audio_source", "format": "audio", "url": href[:1500],
                         "detail": "Источник аудиоплеера в карточке книги."})
-    for reader in node.select(".reader-text, .book-text, .chapter-text, .block_read_text, #reader, "
-                              "#book-content-container, [data-reader-content], [itemprop='text']"):
-        text = compact(reader.get_text(" ", strip=True))
-        if len(text) >= 600 and len(re.findall(r"\w+", text)) >= 80:
+    for embedded in node.select("iframe, object, embed"):
+        raw = embedded.get("data" if embedded.name == "object" else "src", "")
+        href = urljoin(resource_base or base_url, raw)
+        label = embedded.get("title") or embedded.get("aria-label", "")
+        pdf = (embedded.get("type", "").split(";", 1)[0].strip().casefold() == "application/pdf"
+               or bool(re.search(r"\.pdf$", urlsplit(href).path, re.I)))
+        reader_frame = embedded.name == "iframe" and (
+            bool(embedded.get("srcdoc", "").strip())
+            or bool(re.search(r"/(?:read|reader|fb2reader|chitat)(?:/|[_.-]|$)", urlsplit(href).path, re.I))
+            or bool(label and (resource_label_matches(label, title) or re.fullmatch(
+                r"(?:book reader|читалка|текст книги|book text)", label, re.I))))
+        if not (pdf or reader_frame) or (raw and not valid_url(href)):
+            continue
+        if not raw and not embedded.get("srcdoc", "").strip():
+            continue
+        add(embedded, {"kind": "embedded_document", "format": "ebook", "url": (href if raw else base_url)[:1500],
+                       "detail": f"Встроенный документ {embedded.name}; содержимое не проверено."},
+            unverified="Встроенный документ в области книги не проверен; наличие текста произведения не установлено.")
+    readers = node.select(".reader-text, .book-text, .chapter-text, .block_read_text, #reader, "
+                          "#book-content-container, [data-reader-content], [itemprop='text']")
+    known_readers = {id(reader) for reader in readers}
+    # Semantic reading labels/chapter headings establish a candidate, never positive proof.
+    readers += [element for element in node.select('[aria-label]') if re.fullmatch(
+        r"(?:book text|текст(?: книги)?|read online|читать(?: онлайн)?|excerpt|отрывок)",
+        compact(element["aria-label"]), re.I)]
+    readers += [heading for heading in node.find_all(re.compile(r"^h[2-6]$"))
+                if re.fullmatch(r"(?:глава|chapter)\s+[\divxlcdm]+(?:\s.*)?",
+                                text_key(heading.get_text(" ", strip=True)))]
+    seen_readers = set()
+    for reader in readers:
+        if id(reader) in seen_readers:
+            continue
+        seen_readers.add(id(reader))
+        text_node = reader.parent if id(reader) not in known_readers and re.fullmatch(r"h[2-6]", reader.name) else reader
+        text = compact(text_node.get_text(" ", strip=True))
+        enough = len(text) >= 600 and len(re.findall(r"\w+", text)) >= 80
+        if text:
             add(reader, {"kind": "reader_text", "format": "ebook", "url": base_url,
-                         "detail": f"Блок чтения: {len(text)} символов; полнота книги не установлена."})
+                         "detail": f"Блок чтения: {len(text)} символов; полнота книги не установлена."},
+                unverified="" if enough and id(reader) in known_readers else
+                "Явная область чтения: объём текста или HTML-структура недостаточны для подтверждения размещения.")
     if audio_claim:
         for player in node.select('[id*="player"], [class*="playlist"], [data-playlist]'):
             lines = unique(player.get_text("\n", strip=True).splitlines())
@@ -666,8 +943,11 @@ def content_signals(node, base_url, title="", audio_claim=False, authors=(), res
             if len(tracks) >= 2:
                 add(player, {"kind": "audio_playlist", "format": "audio", "url": base_url,
                              "detail": f"Заполненный плеер аудиокниги: не менее {len(tracks)} дорожек."})
-    return list({(item["kind"], item["url"], item["binding"], item["element_locator"]): item
-                 for item in signals}.values())[:30]
+    observed = list({(item["kind"], item["url"], item["binding"], item["element_locator"]): item
+                     for item in signals + unverified_signals}.values())
+    # Bound evidence must survive the observation cap ahead of unrelated regions.
+    priority = {"bound": 0, "unresolved": 1, "other_scope": 2}
+    return sorted(observed, key=lambda item: priority[item["binding"]])[:30]
 
 
 def collection_members(main, title, authors, base_url, resource_base=None):
@@ -738,13 +1018,56 @@ def collection_members(main, title, authors, base_url, resource_base=None):
 def json_books(soup, document_url=""):
     books = []
     primary_ids = set()
+    linked_ids = set()
+    nodes = {}
 
-    def primary_references(value):
+    def has_type(value, name):
+        types = value.get("@type", [])
+        types = [types] if isinstance(types, str) else types
+        return isinstance(types, list) and any(kind in types for kind in (
+            name, "https://schema.org/" + name, "http://schema.org/" + name))
+
+    def reference_key(value):
+        return urljoin(document_url, value) if isinstance(value, str) and value and not re.search(r"\s", value) else ""
+
+    def index_nodes(value):
         if isinstance(value, list):
             for item in value:
-                primary_references(item)
+                index_nodes(item)
         elif isinstance(value, dict):
-            entity = value.get("mainEntity", {})
+            key = reference_key(value.get("@id"))
+            if key and len(value) > 1:  # Bare references are not definitions.
+                if not secondary and has_type(value, "Book"):
+                    linked_ids.add(key)
+                definition = {**value, "@id": key}
+                definitions = nodes.setdefault(key, [])
+                if definition not in definitions:
+                    definitions.append(definition)
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    index_nodes(item)
+
+    def author_name(value):
+        if not isinstance(value, dict):
+            return str(value), False
+        if "@id" not in value:
+            return str(value.get("name", "")), False
+        definitions = nodes.get(reference_key(value["@id"]), [])
+        names = unique(node["name"] for node in definitions if isinstance(node.get("name"), str))
+        if not names or not all(authors_match([names[0]], [name]) for name in names[1:]) or any(
+            ("name" in node and not isinstance(node["name"], str)) or has_type(node, "Book") or ("@type" in node and not (
+            has_type(node, "Person") or has_type(node, "Organization")
+        )) for node in definitions):
+            return "", True
+        return names[0], False
+
+    def primary_references(value, page_only=False):
+        if isinstance(value, list):
+            for item in value:
+                primary_references(item, page_only)
+        elif isinstance(value, dict):
+            entity = value.get("mainEntity", {}) if not page_only or (
+                has_type(value, "WebPage") and on_page(value)) else {}
             entities = entity if isinstance(entity, list) else [entity]
             primary_ids.update(item["@id"] for item in entities if isinstance(item, dict) and item.get("@id"))
             owner = value.get("mainEntityOfPage")
@@ -753,35 +1076,70 @@ def json_books(soup, document_url=""):
                 primary_ids.add(value["@id"])
             for item in value.values():
                 if isinstance(item, (dict, list)):
-                    primary_references(item)
+                    primary_references(item, page_only)
 
-    def visit(value, primary=True):
+    def visit(value, primary=True, page_link=False):
         if isinstance(value, list):
             for item in value:
-                visit(item, primary)
+                visit(item, primary, page_link)
         elif isinstance(value, dict):
-            types = value.get("@type", [])
-            types = [types] if isinstance(types, str) else types
-            if "Book" in types and value.get("name"):
+            if has_type(value, "Book") and value.get("name"):
                 authors = value.get("author", [])
                 authors = authors if isinstance(authors, list) else [authors]
-                books.append({"title": str(value["name"]), "authors": unique(
-                    str(item.get("name", "")) if isinstance(item, dict) else str(item)
-                    for item in authors), "primary_metadata": primary and (
-                        not primary_ids or value.get("@id") in primary_ids)})
+                resolved = [author_name(item) for item in authors]
+                books.append({"title": str(value["name"]), "authors": unique(name for name, _ in resolved),
+                              "_author_unresolved": any(unknown for _, unknown in resolved),
+                              "primary_metadata": primary and (
+                        not primary_ids or value.get("@id") in primary_ids) and (
+                        not secondary or reference_key(value.get("@id")) in linked_ids
+                        or page_link or on_page(value) or (
+                            bool(document_url) and page_owner(value) == document_url)), "_scope_id": owner_id})
             for key, item in value.items():
                 if isinstance(item, (dict, list)):
-                    visit(item, primary and key in {"@graph", "mainEntity"})
+                    visit(item, primary and key in {"@graph", "mainEntity"}, page_link or (
+                        key == "mainEntity" and has_type(value, "WebPage") and on_page(value)))
 
-    for script in soup.select('script[type="application/ld+json"]')[:30]:
+    def on_page(value):
+        return bool(document_url) and any(reference_key(value.get(key)) == document_url for key in ("@id", "url"))
+
+    def page_owner(value):
+        owner = value.get("mainEntityOfPage")
+        owner = owner.get("@id") if isinstance(owner, dict) else owner
+        return reference_key(owner)
+
+    documents = []
+    # The HTTP/browser byte budget bounds this input; script order must not hide
+    # identity conflicts or author definitions. Public summaries remain capped.
+    for script in soup.select('script[type="application/ld+json"]'):
+        owner = next((parent for parent in script.parents if book_boundary(parent)), None)
+        owner_id = id(owner) if owner is not None else None
+        region = next((parent for parent in script.parents
+                       if parent.name not in {"html", "body", "main"} and region_role(parent) == "secondary"), None)
+        # A separate review region owns its metadata. A review nested in a book
+        # does not by itself disprove that book's ownership of the script.
+        secondary = region is not None and not (
+            owner is not None and any(parent is owner for parent in region.parents))
         try:
             data = json.loads(script.string or script.get_text())
+            index_nodes(data)
+            documents.append((data, owner_id, secondary))
+        except (ValueError, TypeError, RecursionError):
+            continue
+    for data, _, secondary in documents:
+        try:
+            primary_ids.clear()
+            primary_references(data, page_only=secondary)
+            linked_ids.update(reference_key(key) for key in primary_ids)
+        except (ValueError, TypeError, RecursionError):
+            continue
+    for data, owner_id, secondary in documents:
+        try:
             primary_ids.clear()
             primary_references(data)
             visit(data)
         except (ValueError, TypeError, RecursionError):
             continue
-    return books[:30]
+    return books
 
 
 def inline_styles(node):
@@ -801,8 +1159,9 @@ def extract_html(document, limits):
     page.title = compact(soup.title.get_text(" ", strip=True)) if soup.title else ""
     for meta in soup.select("meta[name], meta[property]")[:100]:
         name = str(meta.get("property") or meta.get("name")).casefold()
-        if name in {"author", "book:author", "og:title", "og:type", "description", "og:description"}:
-            page.metadata[name] = str(meta.get("content", ""))[:1000]
+        if name in {"author", "book:author", "og:title", "og:type", "og:site_name", "description", "og:description"}:
+            value = str(meta.get("content", ""))
+            page.metadata[name] = value if name in {"author", "book:author"} else value[:1000]
     structured = json_books(soup, document.final_url)
     base = soup.find("base", href=True)
     resource_base = urljoin(document.final_url, base["href"]) if base else document.final_url
@@ -867,6 +1226,12 @@ def extract_html(document, limits):
     main = soup.find("main") or document_root
     page.h1 = unique(element.get_text(" ", strip=True)[:400] for element in main.find_all("h1"))[:5]
     primary_title = page.h1[0] if page.h1 else page.metadata.get("og:title", page.title)
+    # Only the HTML <title> fallback may carry an independently identified site suffix.
+    if not page.h1 and "og:title" not in page.metadata:
+        book_title, separator, site_title = primary_title.rpartition("|")
+        site_name = page.metadata.get("og:site_name", "")
+        if separator and book_title.strip() and site_name and normalize_identity(site_title) == normalize_identity(site_name):
+            primary_title = compact(book_title)
     primary_node = main
     heading = main.find("h1")
     if heading:
@@ -892,7 +1257,7 @@ def extract_html(document, limits):
         author_facts = [{"name": author, "role": "page_metadata_or_heading",
                          "scope_locator": dom_locator(primary_node)} for author in page.authors]
     page.text = main.get_text("\n", strip=True)[:limits.max_text_chars]
-    page.partial = len(main.get_text(" ", strip=True)) > limits.max_text_chars
+    page.partial = len(main.get_text(" ", strip=True)) > limits.max_text_chars or _http_partial(document)
     page.is_collection = bool(re.search(r"сборник|собрание|подборка|каталог|все книги|collection|anthology",
                                         primary_title, re.I))
     audio_claim = bool(re.search(r"аудиокниг|audiobook", page.title, re.I)) and not page.is_collection
@@ -920,6 +1285,9 @@ def extract_html(document, limits):
     page.subjects.append({"title": primary_title, "authors": page.authors, "source": "primary",
                           "author_facts": author_facts,
                           "scope_id": id(primary_node),
+                          "scope_is_book": book_boundary(primary_node),
+                          "scope_ancestors": [id(parent) for parent in primary_node.parents],
+                          "scope_locator": dom_locator(primary_node),
                           "scope": "collection" if page.is_collection else "main",
                           "signals": [] if page.is_collection else primary_signals,
                           "unresolved_signals": [] if page.is_collection else unresolved_signals,
@@ -930,9 +1298,12 @@ def extract_html(document, limits):
     cards += [heading.parent for heading in document_root.find_all(re.compile(r"^h[1-6]$"))
               if heading.parent is not main and heading.parent is not document_root]
     seen = set()
-    for node in cards[:150]:
+    for node in cards:
         if id(node) in seen:
             continue
+        if len(seen) == 150:
+            page.partial = True
+            break
         seen.add(id(node))
         heading = local_heading(node) or node.select_one("[itemprop='name']")
         if heading:
@@ -947,30 +1318,63 @@ def extract_html(document, limits):
                                   "author_facts": author_facts,
                                   "authors": authors, "source": "book_card", "scope": "card",
                                   "scope_id": id(node),
+                                  "scope_is_book": book_boundary(node),
+                                  "scope_ancestors": [id(parent) for parent in node.parents],
+                                  "scope_locator": dom_locator(node),
                                   "signals": bound,
                                   "unresolved_signals": [signal for signal in signals if signal["binding"] == "unresolved"],
                                   "detected_formats": unique(signal["format"] for signal in bound)})
+    dom_scopes = {}
+    for subject in page.subjects:
+        if subject["source"] in {"primary", "book_card"}:
+            dom_scopes.setdefault(subject["scope_id"], subject)
     for book in structured:
+        author_unresolved = book.pop("_author_unresolved", False)
         scope = page.subjects[0]
-        if not page.authors:
-            scope = next((subject for subject in page.subjects if subject["source"] == "book_card"
-                          and identity_heading(subject["title"]) == identity_heading(book["title"])
-                          and subject["authors"]), scope)
+        owner_id = book.pop("_scope_id", None)
+        if owner_id is not None:
+            scope_known = owner_id in dom_scopes
+            scope = dom_scopes.get(owner_id, scope)
+        else:
+            candidates = [subject for subject in dom_scopes.values()
+                          if identity_heading(subject["title"]) == identity_heading(book["title"])
+                          and not title_punctuation_conflict(book["title"], subject["title"])]
+            authored = [subject for subject in candidates if authors_match(book["authors"], subject["authors"])]
+            candidates = authored if authored else candidates
+            scope_known = len(candidates) == 1 or (not candidates and sum(
+                bool(subject["scope_is_book"]) for subject in dom_scopes.values()) <= 1)
+            if len(candidates) == 1:
+                scope = candidates[0]
         scope_title, scope_authors = scope["title"], scope["authors"]
         first, second = identity_heading(scope_title), identity_heading(book["title"])
-        same_title = bool(first and second and (first in second or second in first))
-        if book["primary_metadata"] and not page.is_collection and scope_title:
+        same_title = bool(first and first == second and not title_punctuation_conflict(book["title"], scope_title))
+        if not same_title and scope_authors and book["authors"] and authors_match(scope_authors, book["authors"]):
+            same_title = bool(title_byline_role(scope_title, book["title"], scope_authors))
+        issues = []
+        scoped_book = scope_known and scope.get("scope_is_book")
+        if book["primary_metadata"] and (not page.is_collection or scoped_book) and scope_title:
             if first and second and not same_title:
-                page.issues.append("metadata_title_conflict")
-        same_author = (not book["authors"] or not scope_authors or any(
-            sorted(text_key(first).split()) == sorted(text_key(second).split())
-            for first in book["authors"] for second in scope_authors))
+                issues.append("metadata_title_conflict")
+        same_author = not author_unresolved and (
+            not book["authors"] or not scope_authors or authors_match(book["authors"], scope_authors))
         if book["primary_metadata"] and same_title and not same_author:
-            page.issues.append("metadata_author_conflict")
-        use_primary_scope = book["primary_metadata"] and not page.is_collection and same_title and same_author
+            issues.append("author_missing" if author_unresolved else "metadata_author_conflict")
+        for issue in issues:
+            page.issues.append(issue)
+            page.issue_scopes.setdefault(issue, []).append({
+                "scope_id": scope["scope_id"] if scope_known else None,
+                "scope_is_book": bool(scoped_book), "scope_ancestors": scope.get("scope_ancestors", []),
+                "title": scope_title if scope_known else "не установлена",
+                "scope_locator": scope.get("scope_locator", "") if scope_known else "",
+                "metadata_title": book["title"], "metadata_authors": book["authors"]})
+        use_primary_scope = (book["primary_metadata"] and scope_known and (not page.is_collection or scoped_book)
+                             and same_title and same_author)
         page.subjects.append({**book, "source": "jsonld_book",
                               "scope": "metadata" if book["primary_metadata"] else "recommendation",
-                              "scope_id": scope.get("scope_id") if book["primary_metadata"] else None,
+                              "scope_id": scope.get("scope_id") if book["primary_metadata"] and scope_known else None,
+                              "scope_is_book": bool(scoped_book),
+                              "scope_ancestors": scope.get("scope_ancestors", []),
+                              "scope_locator": scope.get("scope_locator", "") if scope_known else "",
                               "signals": scope["signals"] if use_primary_scope else [],
                               "unresolved_signals": scope.get("unresolved_signals", []) if use_primary_scope else [],
                               "detected_formats": scope.get("detected_formats", []) if use_primary_scope else []})
@@ -1011,23 +1415,71 @@ def pdf_primary_opening(opening):
 
 def pdf_identity_matches(opening, title, authors=()):
     """Corroborate the primary title/byline, never a more convenient later advertisement."""
-    title_key = text_key(title)
+    expected_title = title_key(title)
     names = {variant for author in authors for variant in (
         text_key(author), " ".join(reversed(text_key(author).split())))}
-    expected = {value for name in names for value in (
-        f"{title_key} {name}", f"{name} {title_key}", f"{title_key} by {name}")}
     for start in [pdf_primary_opening(opening)]:
+        raw_lines = [line for line in start.splitlines() if compact(line)][:6]
         lines = [re.sub(r"^(?:title|author|by|название|автор)\s+", "", text_key(line))
-                 for line in start.splitlines() if compact(line)][:6]
+                 for line in raw_lines]
         # A short series heading can precede the byline and a wrapped title.
         offsets = [0, 1] if lines and len(lines[0].split()) <= 10 and not re.search(
             r"recommend|bibliograph|also read|рекоменд|библиограф|другие книги|содержание|contents", lines[0]) else [0]
-        prefixes = {" ".join(lines[offset:count]) for offset in offsets
-                    for count in range(offset + 1, len(lines) + 1)}
-        matched = bool(expected & prefixes) if names else title_key in prefixes
-        if matched:
-            return True
+        for offset in offsets:
+            for count in range(offset + 1, len(lines) + 1):
+                prefix = " ".join(lines[offset:count])
+                candidates = set() if names else {prefix}
+                # Match the author literally before normalizing only the title's number.
+                for name in names:
+                    for suffix in (" " + name, " by " + name):
+                        if prefix.endswith(suffix):
+                            candidates.add(prefix[:-len(suffix)])
+                    if prefix.startswith(name + " "):
+                        candidates.add(prefix[len(name) + 1:])
+                if (any(title_key(candidate) == expected_title for candidate in candidates)
+                    and not title_punctuation_conflict(title, "\n".join(raw_lines[offset:count]))):
+                    return True
     return False
+
+
+def _pdf_document_role(text, subject, identity_lines):
+    """Use document labels and front matter, not isolated words inside a chapter."""
+    roles = {
+        "review": r"book\s+review|review\s+of|critical\s+(?:review|analysis|study)|рецензия|"
+                  r"критический\s+(?:разбор|обзор)|критическое\s+исследование",
+        "study_guide": r"study[-\s]+guide|reading[-\s]+guide|учебное\s+пособие|учебное\s+руководство",
+        "summary": r"(?:plot[-\s]+)?summary\s+of\s+(?:the\s+)?(?:novel|book|work)(?=\s*(?:$|[:;.]))|"
+                   r"plot[-\s]+summary(?=\s*(?:$|[:;.]))|"
+                   r"(?:краткое\s+(?:содержание|изложение)|пересказ)\s+(?:романа|книги|произведения)(?=\s*(?:$|[:;.]))",
+    }
+    companion_headings = {
+        "summary and analysis": "analysis", "themes and analysis": "analysis", "character analysis": "analysis",
+        "discussion questions": "questions", "questions for discussion": "questions", "study questions": "questions",
+    }
+    front_matter = True
+    hints = {}
+    for index, line in enumerate([subject, *text.splitlines()]):
+        key = text_key(line)
+        if not key or key in identity_lines:
+            continue
+        metadata = index == 0
+        if not metadata and re.match(r"^(?:chapter|глава)\s+(?:\d+|[ivxlcdm]+|one|first|первая)\b", key):
+            front_matter = False
+        statement = re.match(
+            r"\s*(?:this (?:document|pdf|file) (?:is|provides|contains|presents)|document type\s*:)\s+(.+)",
+            line, re.I)
+        if metadata or front_matter or statement:
+            label = statement[1] if statement else line
+            if not statement:
+                label = re.sub(r"^\s*this\s+(?:is\s+)?", "", label, flags=re.I)
+            for role, pattern in roles.items():
+                if re.match(r"\s*(?:an?\s+)?(?:" + pattern + r")\b", label, re.I):
+                    return role, compact(line)[:240]
+        if front_matter and not metadata and key in companion_headings:
+            hints[companion_headings[key]] = compact(line)
+    if len(hints) >= 2:
+        return "unresolved", "; ".join(hints.values())[:240]
+    return "", ""
 
 
 def extract_pdf(document, limits):
@@ -1038,7 +1490,8 @@ def extract_pdf(document, limits):
         if reader.is_encrypted and not reader.decrypt(""):
             page.issues.append("encrypted_pdf")
             return page
-        page.metadata = {str(key): str(value)[:1000] for key, value in (reader.metadata or {}).items()}
+        page.metadata = {str(key): str(value) if str(key) == "/Author" else str(value)[:1000]
+                         for key, value in (reader.metadata or {}).items()}
         page.title = page.metadata.get("/Title", "")
         page.authors = [page.metadata["/Author"]] if page.metadata.get("/Author") else []
         if document.pdf_stream:
@@ -1107,20 +1560,36 @@ def extract_pdf(document, limits):
     if not corroborated:
         page.issues.append("pdf_identity_unresolved")
         page.signals.clear()
-    role_lines = pdf_primary_opening(page.opening).splitlines()[:8]
-    role_lines += [page.metadata.get("/Subject", "")]
     identity_lines = {text_key(page.title), *(text_key(author) for author in page.authors)}
-    if any(text_key(line) not in identity_lines and re.match(
-        r"\s*(?:book review\b|review of\b|рецензия\b|критический разбор\b)", line, re.I) for line in role_lines):
-        page.metadata["document_role"] = "review"
+    role, role_evidence = _pdf_document_role("\n".join(texts[:3])[:limits.max_text_chars],
+                                             page.metadata.get("/Subject", ""), identity_lines)
+    if role:
+        page.metadata["document_role"] = role
+        page.metadata["document_role_evidence"] = role_evidence
         page.issues.append("pdf_document_role_unresolved")
-        page.signals.clear()
+        for signal in page.signals:
+            signal.update(binding="unresolved", binding_reason="Роль PDF не подтверждает текст произведения: " + role_evidence)
+        page.subjects[0]["signals"] = []
+        page.subjects[0]["unresolved_signals"] = page.signals
     return page
+
+
+def _http_partial(document):
+    """A 206 HTML fragment is complete only with a consistent full byte range."""
+    if document.http_status != 206:
+        return False
+    headers = {key.lower(): value for key, value in document.headers.items()}
+    found = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", headers.get("content-range", "").strip(), re.I)
+    # Missing, malformed and unknown totals do not prove completeness.
+    complete = bool(found and int(found[1]) + 1 == int(found[2]) > 0)
+    if complete and headers.get("content-encoding", "identity").casefold() in {"", "identity"}:
+        complete = len(document.body) == int(found[2])
+    return not complete
 
 
 def extract_page(document, limits=Limits()):
     if document.error_code or not document.body:
-        return Page(issues=["not_loaded"])
+        return Page(issues=["not_loaded"], partial=_http_partial(document))
     content_type = next((value for key, value in document.headers.items()
                          if key.lower() == "content-type"), "").casefold()
     try:

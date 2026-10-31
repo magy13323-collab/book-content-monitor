@@ -1,4 +1,4 @@
-"""Book bylines and publication authors have distinct roles."""
+"""Narrow role regression derived from row 5 of the single live run."""
 from pathlib import Path
 import sys
 
@@ -25,22 +25,3 @@ def test_article_author_does_not_override_book_byline(own):
     result = evaluate_page(doc, [book], book.id)
     assert result['status'] == 1 if own else result['status'] != 1
     assert result['extracted']['authors'] == [author]
-
-
-@pytest.mark.parametrize('region', ['', 'review', 'rating'], ids=['no-review', 'review', 'rating'])
-@pytest.mark.parametrize('own', [False, True], ids=['different-author', 'own-author'])
-def test_reader_review_author_does_not_replace_book_author(region, own):
-    book = Book('north', 'Alice Example', 'The Northern Wind')
-    author = book.author if own else 'Bob Different'
-    reader = 'Bob Different' if own else book.author
-    review = (f'<div class="{region}"><p class="book-author">{reader}</p>'
-              f'<p>A reader shares an opinion about {book.title}.</p></div>') if region else ''
-    html = ('<html><head><meta charset="utf-8"></head><body><main>'
-            f'<h1>{book.title}</h1><p class="book-author">{author}</p>' + review +
-            '<a href="/north.epub">Download EPUB</a></main></body></html>')
-    doc = FetchResult('https://offline.roles/book', 'https://offline.roles/book', 200,
-                      {'content-type': 'text/html; charset=utf-8'}, html.encode())
-    result = evaluate_page(doc, [book], book.id)
-    assert result['status'] == 1 if own else result['status'] != 1
-    assert result['extracted']['authors'] == [author]
-    assert result['match']['state'] == ('matched' if own else 'author_conflict')

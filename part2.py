@@ -15,8 +15,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 import requests
 
-from pages import extract_page, fetch_url, pdf_identity_matches, text_key
-from part1 import group_id, normalize_text, normalize_url
+from pages import (authors_match, extract_page, fetch_url, number_value, pdf_identity_matches,
+                   text_key, title_byline_role, title_key, title_punctuation_conflict, volume_conflict, volume_markers)
+from part1 import group_id, normalize_identity, normalize_text, normalize_url
 
 
 @dataclass(frozen=True)
@@ -28,62 +29,38 @@ class Book:
 
 
 def author_matches(expected, observed):
-    first, second = text_key(expected), text_key(observed)
-    if first == second:
-        return bool(first)
-    # Full names may appear surname-first; initials or partial surnames are insufficient.
-    return (len(first.split()) >= 2 and all(len(word) > 1 for word in first.split())
-            and sorted(first.split()) == sorted(second.split()))
-
-
-def number_value(number):
-    if number.isdigit():
-        return int(number)
-    total, previous = 0, 0
-    for character in reversed(number):
-        value = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}[character]
-        total += -value if value < previous else value
-        previous = max(previous, value)
-    return total
-
-
-def volume_markers(title):
-    key = text_key(title)
-    labels = {"том": "volume", "volume": "volume", "vol": "volume",
-              "книга": "book", "book": "book", "часть": "part", "ч": "part", "part": "part"}
-    return {labels[label]: number_value(number) for label, number in re.findall(
-        r"\b(том|книга|часть|ч|volume|vol|book|part)\s+(\d+|[ivxlcdm]+)\b", key)}
+    return authors_match([expected], [observed])
 
 
 def title_relation(book, observed):
-    def canonical(title):
-        return re.sub(r"\b(том|книга|часть|ч|volume|vol|book|part)\s+(\d+|[ivxlcdm]+)\b",
-                      lambda match: match[1] + " " + str(number_value(match[2])), text_key(title))
-
-    expected = canonical(book.title)
-    candidate = canonical(observed.split("|", 1)[0])
-    author = text_key(book.author)
-    for variant in (author, " ".join(reversed(author.split()))):
-        if variant:
-            candidate = re.sub(r"(?:^|\s)" + re.escape(variant) + r"(?:\s|$)", " ", candidate).strip()
+    expected = title_key(book.title)
+    candidate = title_key(observed)
+    family = lambda title: re.split(r"\b(?:том|книга|часть|ч|volume|vol|book|part)\b", title_key(title))[0].strip()
+    conflicting_volumes = (volume_conflict(book.title, observed)
+                           and family(book.title) == family(observed))
+    if "|" in observed and conflicting_volumes:
+        return "volume_conflict"
     if candidate == expected:
+        return "punctuation_variant" if title_punctuation_conflict(book.title, observed) else "exact"
+    if title_byline_role(observed, book.title, [book.author]) == "author_list":
         return "exact"
     # Only known service words around a full title are accepted as decoration.
     if f" {expected} " in f" {candidate} ":
         rest = (" " + candidate + " ").replace(" " + expected + " ", " ").strip()
         if re.fullmatch(r"(?:(?:читать|книгу|скачать|онлайн|полностью|бесплатно|аудиокнига|аудиокнигу|fb2|epub|pdf|txt|mp3|торрент)\s*)+", rest):
-            return "exact"
-        return "partial"
-    expected_numbers, actual_numbers = volume_markers(book.title), volume_markers(observed)
-    if any(key in actual_numbers and actual_numbers[key] != value for key, value in expected_numbers.items()):
-        family = lambda title: re.split(r"\b(?:том|книга|часть|volume|vol|book|part)\b", text_key(title))[0].strip()
-        if family(book.title) and family(book.title) == family(observed):
-            return "volume_conflict"
+            return "punctuation_variant" if title_punctuation_conflict(book.title, observed) else "exact"
+        return "punctuation_variant" if "|" in observed or "|" in book.title else "partial"
+    if conflicting_volumes:
+        return "volume_conflict"
+    if "ё" in expected or "ё" in candidate:
+        folded = replace(book, title=normalize_text(book.title), author=normalize_text(book.author))
+        if title_relation(folded, normalize_text(observed)) in {"exact", "partial"}:
+            return "yo_variant"
     return "none"
 
 
 def contains_title(text, title):
-    return bool(text_key(title)) and f" {text_key(title)} " in f" {text_key(text)} "
+    return bool(title_key(title)) and f" {title_key(title)} " in f" {title_key(text)} "
 
 
 def match_one(page, book):
@@ -93,29 +70,44 @@ def match_one(page, book):
         and pdf_identity_matches(page.opening, book.title, [book.author])):
         # Only a title/byline prefix can identify the document, never arbitrary mentions.
         subjects.append({"title": book.title, "authors": [book.author], "source": "pdf_opening",
-                         "scope": "pdf", "signals": page.signals})
-    outcomes = []
+                         "scope": "pdf", "signals": [signal for signal in page.signals
+                                                     if signal.get("binding", "bound") == "bound"]})
+    outcomes, variants = [], []
     for subject in subjects:
         relation = title_relation(book, subject["title"])
         if relation == "none":
             continue
+        yo_variant = relation == "yo_variant"
+        punctuation_variant = relation == "punctuation_variant"
         if relation == "volume_conflict":
             state = "volume_conflict"
-        elif relation == "partial":
+        elif relation in {"partial", "yo_variant", "punctuation_variant"}:
             state = "ambiguous"
         elif not subject["authors"]:
             state = "author_missing"
-        elif not any(author_matches(book.author, author) for author in subject["authors"]):
-            state = "author_conflict"
+        elif not authors_match([book.author], subject["authors"]):
+            yo_variant = authors_match([book.author.replace("ё", "е").replace("Ё", "Е")],
+                                       [a.replace("ё", "е").replace("Ё", "Е") for a in subject["authors"]])
+            state = "ambiguous" if yo_variant else "author_conflict"
         else:
             state = "matched"
-        outcomes.append({"state": state, "book_id": book.id, "subject": subject,
+        outcome = {"state": state, "book_id": book.id, "subject": subject,
                           "signals": subject["signals"],
                           "unresolved_signals": subject.get("unresolved_signals", []),
                           "detected_formats": subject.get("detected_formats", sorted({
                               signal["format"] for signal in subject["signals"]})),
                          "identity_evidence": [f"{subject['source']}: {subject['title'][:180]}",
-                                               "Автор: " + "; ".join(subject["authors"])[:180]]})
+                                               "Автор: " + "; ".join(subject["authors"])[:180]]}
+        if yo_variant or punctuation_variant:
+            reason = ("Различие е/ё требует подтверждения идентичности; поискового сходства недостаточно."
+                      if yo_variant else "Пунктуация названия различается; одинаковых слов недостаточно для подтверждения идентичности.")
+            outcome["unresolved_signals"] = [
+                {**signal, "binding": "unresolved", "binding_reason": reason}
+                for signal in subject["signals"] + subject.get("unresolved_signals", [])]
+            outcome["signals"] = []
+            outcome["identity_evidence"].append(reason + " Каталог: " + book.title + "; " + book.author)
+            variants.append(outcome)
+        outcomes.append(outcome)
     priority = {"matched": 0, "author_conflict": 1, "author_missing": 2,
                 "volume_conflict": 3, "ambiguous": 4}
     if outcomes:
@@ -128,15 +120,40 @@ def match_one(page, book):
             ) for item in outcomes
         ):
             chosen = {**chosen, "state": "author_conflict"}
+        if chosen["state"] == "matched" and not chosen["signals"]:
+            chosen = next((item for item in variants if item["unresolved_signals"]), chosen)
         return chosen
-    if contains_title(page.text, book.title):
+    if contains_title(page.text, book.title) or contains_title(normalize_text(page.text), normalize_text(book.title)):
         return {"state": "mentioned", "book_id": book.id, "signals": [],
                 "identity_evidence": ["Название найдено в тексте, но не в подтверждённой карточке книги."]}
     return {"state": "no_match", "book_id": None, "signals": [], "identity_evidence": []}
 
 
 def match_book(page, catalog, expected_id=None):
+    catalog = list(catalog)
     outcomes = {book.id: match_one(page, book) for book in catalog}
+    for subject in page.subjects:
+        if subject["source"] not in {"primary", "book_card"} or not any(
+            title_key(book.title) == title_key(subject["title"])
+            and not title_punctuation_conflict(book.title, subject["title"])
+            and authors_match([book.author], subject["authors"]) for book in catalog
+        ):
+            continue
+        metadata = next((item for item in page.subjects if item["source"] == "jsonld_book"
+                         and item.get("primary_metadata") and item.get("scope_id") == subject.get("scope_id")
+                         and authors_match(subject["authors"], item["authors"])
+                         and title_byline_role(subject["title"], item["title"], subject["authors"])), None)
+        if metadata is None:
+            continue
+        reason = ("Полное каталожное заглавие совпало с HTML, но противоречит JSON-LD; роль подписи автора неоднозначна: "
+                  + subject["title"] + " / " + metadata["title"])
+        for outcome in outcomes.values():
+            if outcome["state"] == "matched" and outcome["subject"].get("scope_id") == subject.get("scope_id"):
+                outcome["state"] = "ambiguous"
+                outcome["identity_evidence"].append(reason)
+                outcome["unresolved_signals"] = [{**signal, "binding": "unresolved", "binding_reason": reason}
+                                                 for signal in outcome["signals"] + outcome["unresolved_signals"]]
+                outcome["signals"] = []
     if expected_id is not None:
         selected = outcomes.get(expected_id, {"state": "catalog_missing", "book_id": expected_id,
                                               "signals": [], "identity_evidence": []})
@@ -181,7 +198,7 @@ REASONS = {
     "pdf_no_text": "PDF не содержит достаточного извлекаемого текста; OCR не выполнялся.",
     "pdf_identity_unresolved": "Название и автор из метаданных PDF не подтверждены началом текста; "
                                "возможен конфликт метаданных и содержимого, идентичность книги не установлена.",
-    "pdf_document_role_unresolved": "PDF идентифицирует книгу, но обозначен как рецензия или критический разбор; текст произведения не подтверждён.",
+    "pdf_document_role_unresolved": "PDF идентифицирует книгу, но имеются признаки пересказа, рецензии, критического разбора или учебных материалов; текст произведения не подтверждён.",
     "encrypted_pdf": "PDF зашифрован; содержимое недоступно без пароля.",
     "extraction_error": "Документ получен, но не удалось надёжно извлечь данные.",
     "unsupported_content_type": "Получен неподдерживаемый тип ответа, а не HTML/PDF.",
@@ -201,6 +218,8 @@ def classify(document, page, match, catalog):
     confirmed = match["state"] == "matched" and bool(match["signals"])
     weak = {"insufficient_html", "access_challenge", "login_required", "content_requires_js"}
     for issue in page.issues:
+        if not page.issue_applies(issue, match.get("subject")):
+            continue
         if issue in weak and issue not in page.blocking_issues:
             if confirmed:
                 continue
@@ -224,13 +243,14 @@ def classify(document, page, match, catalog):
             return 2, "content_scope_unresolved", REASONS["content_scope_unresolved"]
         if page.partial:
             return 2, "partial_document", REASONS["partial_document"]
-        return 0, "content_not_confirmed", REASONS["content_not_confirmed"]
+        # PDF thresholds establish positive evidence, not the absence of the work.
+        return (2 if page.kind == "pdf" else 0), "content_not_confirmed", REASONS["content_not_confirmed"]
     if state != "no_match":
         return 2, state, REASONS[state]
-    if page.kind == "pdf" and page.title and page.authors and contains_title(page.opening, page.title):
-        return 0, "different_pdf_book", REASONS["different_pdf_book"]
     if page.partial:
         return 2, "partial_document", REASONS["partial_document"]
+    if page.kind == "pdf" and page.title and page.authors and contains_title(page.opening, page.title):
+        return 0, "different_pdf_book", REASONS["different_pdf_book"]
     return 0, "no_match", REASONS["no_match"]
 
 
@@ -250,12 +270,26 @@ def evaluate_page(document, catalog, expected_id=None):
                      for signal in match.get("unresolved_signals", [])[:3]]
     if reason_code == "pdf_identity_unresolved":
         evidence.append("Начало текста PDF: " + page.summary()["text_excerpt"])
+    if reason_code == "pdf_document_role_unresolved":
+        evidence.append("Признаки роли PDF: " + page.metadata.get("document_role_evidence", ""))
     if reason_code in {"metadata_title_conflict", "metadata_author_conflict"}:
-        evidence += [f"Основной JSON-LD: {subject['title']}; автор: {'; '.join(subject['authors'])}"[:400]
-                     for subject in page.subjects if subject.get("primary_metadata")]
+        scopes = page.issue_scopes.get(reason_code, [])
+        evidence += [f"JSON-LD: {scope['metadata_title']}; автор: {'; '.join(scope['metadata_authors'])}; "
+                     f"область: {scope['title']} {scope['scope_locator']}"[:400] for scope in scopes]
+        if not scopes:
+            evidence += [f"Основной JSON-LD: {subject['title']}; автор: {'; '.join(subject['authors'])}"[:400]
+                         for subject in page.subjects if subject.get("primary_metadata")]
+    for issue, scopes in page.issue_scopes.items():
+        if not page.issue_applies(issue, match.get("subject")):
+            evidence.insert(0, "Ошибка независимой карточки не относится к выбранной книге: " + issue + "; " +
+                            "; ".join(f"{scope['title']} {scope['scope_locator']} (JSON-LD: {scope['metadata_title']})"
+                                      for scope in scopes)[:300])
     if not evidence and page.title:
         evidence = ["Извлечённый заголовок: " + page.title[:200],
                     "Извлечённые авторы: " + "; ".join(page.authors)[:180]]
+    if reason_code == "partial_document" and page.kind == "pdf":
+        evidence.append(f"Прочитано страниц PDF: {page.pdf_pages_read}/{page.pdf_page_count}; "
+                        "анализ документа неполон, отсутствие произведения не установлено.")
     if document.error_code:
         evidence = [f"HTTP: {document.http_status}; {document.error_code}; {document.error_detail}"[:500]]
     public_match = {key: value for key, value in match.items() if key not in {"subject", "signals"}}
@@ -337,9 +371,8 @@ def complete_evidence(result):
         result["evidence"] = [
             f"HTTP {result['http_status']}; ответ {result['response_bytes']} байт; "
             f"извлечено {result['extracted']['text_chars']} символов.",
+            "Проблемы извлечения: " + ", ".join(result["extracted"]["issues"]),
         ]
-        if result["extracted"]["issues"]:
-            result["evidence"].append("Проблемы извлечения: " + ", ".join(result["extracted"]["issues"]))
     result["evidence"] = list(dict.fromkeys(result["evidence"]))
     return result
 
@@ -347,7 +380,7 @@ def complete_evidence(result):
 def load_inputs(path):
     path = Path(path)
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
-    books, targets = {}, []
+    books, targets, identities = {}, [], {}
     try:
         sheet = workbook.worksheets[1]
         for number, values in enumerate(sheet.iter_rows(min_row=2, max_col=6, values_only=True), 2):
@@ -356,8 +389,12 @@ def load_inputs(path):
             _, author, title, content_type, url, _ = values
             if not author or not title:
                 raise ValueError(f"Строка {number}: в мини-каталоге отсутствует автор/название.")
-            identifier = group_id("book", (normalize_text(author), normalize_text(title), normalize_text(content_type)))
-            books[identifier] = Book(identifier, str(author), str(title), str(content_type or "ebook"))
+            key = (normalize_identity(author), normalize_identity(title), normalize_text(content_type))
+            identifier = group_id("book", key)
+            if identifier in identities and identities[identifier] != key:
+                raise ValueError(f"Коллизия идентификатора книги {identifier}, строка {number}; кандидаты не перезаписаны.")
+            identities[identifier] = key
+            books.setdefault(identifier, Book(identifier, str(author), str(title), str(content_type or "ebook")))
             targets.append({"url": normalize_url(url), "expected_book_id": identifier,
                             "source_file": path.name, "source_sheet": sheet.title, "source_row": number,
                             "expected_author": author, "expected_title": title, "expected_type": content_type})

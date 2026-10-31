@@ -10,7 +10,7 @@ from test_new_rules import CATALOG, document, no_requests
 
 
 @pytest.mark.parametrize("offer", [
-    'Рекомендуем другую книгу Другой маршрут <a href="https://ads.example/south.epub">Скачать EPUB</a>',
+    'Рекомендуем другую книгу Южный берег <a href="https://ads.example/south.epub">Скачать EPUB</a>',
     'Выгодное предложение <a href="/south.epub">Скачать EPUB</a>',
     'Рекомендуем <span>другую книгу <a href="/south.epub">Скачать EPUB</a></span>',
     '<span>Реклама чужой книги <a href="/south.epub">Скачать EPUB</a></span>',
@@ -65,7 +65,7 @@ def test_metadata_only_dynamic_content_uses_browser_when_needed(content, calls, 
 
 
 def test_standalone_book_named_story_collection_keeps_direct_epub():
-    book = Book("stories", "Лада Макетова", "Сборник рассказов")
+    book = Book("stories", "Анна Лесная", "Сборник рассказов")
     initial = document('<a href="/stories.epub">Скачать EPUB</a>')
     initial.body = initial.body.decode().replace(CATALOG[0].title, book.title).encode()
     result = evaluate_page(initial, [book], book.id)
@@ -79,7 +79,7 @@ def test_individual_cards_on_editorial_lists_have_local_evidence(heading, own_fi
     link = '<a href="/north.epub">Скачать EPUB</a>' if own_file else ''
     html = (f'<main><h1>{heading}</h1><article class="book-card"><h2>{CATALOG[0].title}</h2>'
             f'<p class="book-author">{CATALOG[0].author}</p>{link}</article>'
-            '<article><h2>Другой маршрут</h2><p class="book-author">Олег Макетный</p>'
+            '<article><h2>Южный берег</h2><p class="book-author">Иван Другой</p>'
             '<a href="/south.epub">Скачать EPUB</a></article></main>')
     initial = FetchResult("https://example.org/list", "https://example.org/list", 200,
                           {"Content-Type": "text/html; charset=utf-8"}, html.encode())
@@ -90,8 +90,8 @@ def test_individual_cards_on_editorial_lists_have_local_evidence(heading, own_fi
 
 
 @pytest.mark.parametrize(("title", "author"), [
-    ("Другой маршрут", "Олег Макетный"),
-    (CATALOG[0].title, "Олег Макетный"),
+    ("Южный берег", "Иван Другой"),
+    (CATALOG[0].title, "Иван Другой"),
 ])
 def test_recommended_jsonld_book_cannot_cancel_verified_primary_card(title, author):
     metadata = {"@type": "Book", "name": CATALOG[0].title,

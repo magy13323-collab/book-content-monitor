@@ -9,7 +9,7 @@ from pages import FetchResult
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
-CATALOG = [Book("north", "Лада Макетова", "Учебный маршрут. Том 1", "ebook")]
+CATALOG = [Book("north", "Анна Лесная", "Учебный маршрут. Том 1", "ebook")]
 
 
 @pytest.fixture

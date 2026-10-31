@@ -62,3 +62,36 @@ examples/output/*
 .submission*/
 .portfolio*/
 node_modules/
+
+# Original inputs and private audit/development artifacts
+/data/
+/rt09_rt10_work/
+/audit/
+/audits/
+/backups/
+/backup/
+/fixes/
+/internal/
+/.stage/
+/STAGING_REPORT.md
+/BookMonitor-*/
+*.orig
+*.rej
+*.backup
+*.docx
+*.doc
+*.sqlite*
+*.db
+
+# Binary spreadsheets/documents: only the reviewed synthetic assets are publishable
+*.xls
+*.xlsx
+*.xlsm
+*.pdf
+!examples/synthetic_input.xlsx
+!examples/output/part1_processed.xlsx
+!examples/output/part2_results.xlsx
+!examples/fixtures/own.pdf
+!examples/fixtures/foreign.pdf
+!examples/fixtures/review.pdf
+!tests/fixtures/rt08/pdf_summary_role.pdf

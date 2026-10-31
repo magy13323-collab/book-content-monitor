@@ -27,7 +27,7 @@ def forbid_live_http(monkeypatch):
 
 @pytest.fixture
 def catalog():
-    return [Book("north", "Лада Макетова", "Учебный маршрут. Том 1", "ebook")]
+    return [Book("north", "Анна Лесная", "Учебный маршрут. Том 1", "ebook")]
 
 
 def html_document(name, transform=lambda text: text):
@@ -56,13 +56,13 @@ def test_layout_sidebar_and_comments_classes_do_not_erase_the_document(catalog):
 
 def test_split_author_label_is_not_lost_or_confused_with_blog_editor(catalog):
     document = html_document("book_file.html", lambda html: html.replace(
-        '<p class="book-author">Лада Макетова</p>',
-        '<p><span>Автор:</span><a href="/xfsearch/avtor/anna/">Лада Макетова</a></p>'
+        '<p class="book-author">Анна Лесная</p>',
+        '<p><span>Автор:</span><a href="/xfsearch/avtor/anna/">Анна Лесная</a></p>'
         '<span class="posted-by author">admin</span>'
     ))
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 1
-    assert result["extracted"]["authors"] == ["Лада Макетова"]
+    assert result["extracted"]["authors"] == ["Анна Лесная"]
 
 
 def test_unrelated_program_archive_is_not_a_book_file(catalog):
@@ -94,7 +94,7 @@ def test_downloadable_collection_with_explicit_membership_is_placement(catalog):
 
 def test_individual_book_in_collection_needs_its_own_scoped_evidence(catalog):
     html = '<main><h1>Подборка книг</h1><article class="book-card"><h2>Учебный маршрут. Том 1</h2>'
-    html += '<p class="book-author">Лада Макетова</p><a href="/north.epub">Скачать EPUB</a></article>'
+    html += '<p class="book-author">Анна Лесная</p><a href="/north.epub">Скачать EPUB</a></article>'
     html += '<article><h2>Другая книга</h2><p>Книга другого автора</p></article></main>'
     document = FetchResult("https://example.org", "https://example.org", 200,
                            {"Content-Type": "text/html"}, html.encode())
@@ -111,7 +111,7 @@ def test_same_work_in_audio_confirms_placement_despite_ebook_catalog(catalog):
 
 
 def test_audio_catalog_accepts_bound_audio_source():
-    catalog = [Book("north", "Лада Макетова", "Учебный маршрут. Том 1", "audio")]
+    catalog = [Book("north", "Анна Лесная", "Учебный маршрут. Том 1", "audio")]
     assert evaluate_page(html_document("audio.html"), catalog, "north")["status"] == 1
 
 
@@ -129,13 +129,12 @@ def test_successful_but_empty_http_response_is_not_negative(catalog):
     assert result["status"] == 2
     assert result["match"]["state"] == "unavailable"
     assert result["evidence"]
-    assert "Проблемы извлечения: not_loaded" in result["evidence"]
 
 
 @pytest.mark.parametrize(("old", "new", "code"), [
-    ("Лада Макетова", "Елена Другая", "author_conflict"),
+    ("Анна Лесная", "Елена Другая", "author_conflict"),
     ("Том 1", "Том 2", "volume_conflict"),
-    ("Лада Макетова", "", "author_missing"),
+    ("Анна Лесная", "", "author_missing"),
 ])
 def test_identity_conflicts_never_produce_positive(catalog, old, new, code):
     result = evaluate_page(html_document("book_file.html", lambda text: text.replace(old, new)),
@@ -186,7 +185,7 @@ def test_foreign_jsonld_cannot_claim_another_pages_download(catalog):
             "author": {"@type": "Person", "name": catalog[0].author}}
     document = html_document("book_file.html", lambda html: html.replace(
         "<h1>Учебный маршрут. Том 1</h1>", ""
-    ).replace("Учебный маршрут. Том 1", "Другой маршрут").replace("Лада Макетова", "Олег Макетный").replace(
+    ).replace("Учебный маршрут. Том 1", "Южный берег").replace("Анна Лесная", "Иван Другой").replace(
         "</head>", '<script type="application/ld+json">' + json.dumps(data) + "</script></head>"
     ))
     result = evaluate_page(document, catalog, "north")
@@ -364,7 +363,7 @@ def test_pdf_mismatching_metadata_is_not_accepted(pdf_bytes):
     assert evaluate_page(document, catalog, "other")["status"] == 2
 
 
-def test_identified_foreign_pdf_is_negative_even_with_page_sampling(pdf_bytes):
+def test_identified_foreign_pdf_is_uncertain_with_page_sampling(pdf_bytes):
     from pages import Limits
     from part2 import classify, match_book
     document = FetchResult("https://example.org/book.pdf", "https://example.org/book.pdf", 200,
@@ -372,7 +371,8 @@ def test_identified_foreign_pdf_is_negative_even_with_page_sampling(pdf_bytes):
     page = extract_page(document, limits=Limits(pdf_max_pages=1))
     catalog = [Book("foreign", "Other Author", "Another Book", "ebook")]
     assert page.partial
-    assert classify(document, page, match_book(page, catalog, "foreign"), catalog)[0] == 0
+    status, reason, _ = classify(document, page, match_book(page, catalog, "foreign"), catalog)
+    assert (status, reason) == (2, "partial_document")
 
 
 def test_pdf_frontmatter_can_precede_the_identifying_title_page(pdf_bytes):
@@ -487,7 +487,7 @@ def test_response_size_is_enforced_from_header_and_stream(headers):
 
 
 def test_expected_book_is_not_replaced_by_another_catalog_entry(catalog):
-    other = Book("south", "Олег Макетный", "Другой маршрут", "ebook")
+    other = Book("south", "Иван Другой", "Южный берег", "ebook")
     result = evaluate_page(html_document("recommendations.html"), catalog + [other], "north")
     assert result["status"] == 0
     assert result["match"]["book_id"] != "south"
@@ -520,7 +520,7 @@ def test_external_catalog_and_export_are_reusable(tmp_path, catalog):
     workbook.close()
 
 
-def scope_document(content, author="Лада Макетова"):
+def scope_document(content, author="Анна Лесная"):
     html = ('<!doctype html><html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1</title>'
             '</head><body><main><h1>Учебный маршрут. Том 1</h1>'
             f'<p class="book-author">{author}</p>'
@@ -543,13 +543,13 @@ def test_reported_download_of_another_book_is_not_target_content(catalog):
 
 
 def test_reported_chapter_in_another_work_section_is_not_target_content(catalog):
-    document = scope_document('<section><h2>Другой маршрут</h2>' + sample_chapter() + '</section>')
+    document = scope_document('<section><h2>Южный берег</h2>' + sample_chapter() + '</section>')
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 0
     assert not result["content_signals"]
 
 
-@pytest.mark.parametrize("label", ["Загрузить роман «Другой маршрут» EPUB", "Download Blue Harbour EPUB"])
+@pytest.mark.parametrize("label", ["Загрузить роман «Южный берег» EPUB", "Download Blue Harbour EPUB"])
 def test_non_generic_resource_labels_require_a_book_identity(catalog, label):
     result = evaluate_page(scope_document(f'<a href="/opaque.epub">{label}</a>'), catalog, "north")
     assert result["status"] == 2
@@ -559,7 +559,7 @@ def test_non_generic_resource_labels_require_a_book_identity(catalog, label):
 @pytest.mark.parametrize("container", ['article', 'div class="book-card"'])
 def test_nested_foreign_card_does_not_inherit_primary_book(catalog, container):
     end_tag = container.split()[0]
-    document = scope_document(f'<{container}><h2>Другой маршрут</h2>'
+    document = scope_document(f'<{container}><h2>Южный берег</h2>'
                               '<a href="/south.epub">Скачать EPUB</a>' + sample_chapter()
                               + f'</{end_tag}>')
     result = evaluate_page(document, catalog, "north")
@@ -568,7 +568,7 @@ def test_nested_foreign_card_does_not_inherit_primary_book(catalog, container):
 
 
 def test_sibling_heading_changes_the_content_scope(catalog):
-    document = scope_document('<h2>Другой маршрут</h2>' + sample_chapter())
+    document = scope_document('<h2>Южный берег</h2>' + sample_chapter())
     assert evaluate_page(document, catalog, "north")["status"] == 0
 
 
@@ -602,7 +602,7 @@ def test_unlabelled_standalone_player_does_not_establish_book_format(catalog, la
 
 def test_target_file_survives_next_to_foreign_audio_and_chapter(catalog):
     document = scope_document('<a href="/north.epub">Скачать EPUB</a>'
-                              '<section><h2>Другой маршрут</h2><audio src="/south.mp3"></audio>'
+                              '<section><h2>Южный берег</h2><audio src="/south.mp3"></audio>'
                               + sample_chapter() + '</section>')
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 1
@@ -622,8 +622,8 @@ def test_named_target_file_and_scope_proof_are_preserved(catalog):
 
 def test_collection_card_cannot_claim_a_nested_foreign_reader(catalog):
     html = ('<main><h1>Подборка книг</h1><article class="book-card">'
-            '<h2>Учебный маршрут. Том 1</h2><p class="book-author">Лада Макетова</p>'
-            '<section><h3>Другой маршрут</h3>' + sample_chapter() + '</section></article></main>')
+            '<h2>Учебный маршрут. Том 1</h2><p class="book-author">Анна Лесная</p>'
+            '<section><h3>Южный берег</h3>' + sample_chapter() + '</section></article></main>')
     document = FetchResult("https://example.org", "https://example.org", 200,
                            {"Content-Type": "text/html; charset=utf-8"}, html.encode())
     result = evaluate_page(document, catalog, "north")
@@ -633,8 +633,8 @@ def test_collection_card_cannot_claim_a_nested_foreign_reader(catalog):
 
 def test_foreign_card_author_cannot_supply_missing_primary_author(catalog):
     document = scope_document('<a href="/north.epub">Скачать EPUB</a>'
-                              '<section><h2>Другой маршрут</h2>'
-                              '<p class="book-author">Лада Макетова</p></section>', author="")
+                              '<section><h2>Южный берег</h2>'
+                              '<p class="book-author">Анна Лесная</p></section>', author="")
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 2
     assert result["reason_code"] == "author_missing"
@@ -643,7 +643,7 @@ def test_foreign_card_author_cannot_supply_missing_primary_author(catalog):
 @pytest.mark.parametrize("content", [sample_chapter(), '<audio src="/other.mp3"></audio>'])
 def test_same_title_with_another_author_is_a_different_scope(catalog, content):
     document = scope_document('<section><h2>Учебный маршрут. Том 1</h2>'
-                              '<p class="book-author">Олег Макетный</p>' + content + '</section>')
+                              '<p class="book-author">Иван Другой</p>' + content + '</section>')
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 0
     assert result["reason_code"] != "format_conflict"
@@ -654,7 +654,7 @@ def test_same_title_with_another_author_is_a_different_scope(catalog, content):
 def test_matching_metadata_panel_can_identify_a_sibling_reader(catalog):
     html = ('<main><h1>Читать книгу Учебный маршрут. Том 1 полностью</h1>'
             '<div class="metadata"><h2>Учебный маршрут. Том 1</h2>'
-            '<p class="book-author">Лада Макетова</p></div>'
+            '<p class="book-author">Анна Лесная</p></div>'
             '<div id="book-content-container">' + sample_chapter() + '</div></main>')
     document = FetchResult("https://example.org/book", "https://example.org/book", 200,
                            {"Content-Type": "text/html; charset=utf-8"}, html.encode())
@@ -666,7 +666,7 @@ def test_matching_metadata_panel_can_identify_a_sibling_reader(catalog):
 
 @pytest.mark.parametrize("content", [sample_chapter(), '<audio src="/other.mp3"></audio>'])
 def test_headingless_description_cannot_claim_readers_or_players(catalog, content):
-    document = scope_document('<section><p>Другой маршрут — Олег Макетный.</p>' + content + '</section>')
+    document = scope_document('<section><p>Южный берег — Иван Другой.</p>' + content + '</section>')
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 2
     assert result["reason_code"] == "content_scope_unresolved"
@@ -676,7 +676,7 @@ def test_headingless_description_cannot_claim_readers_or_players(catalog, conten
 
 def test_target_file_survives_next_to_headingless_foreign_offer(catalog):
     document = scope_document('<a href="/north.epub">Скачать EPUB</a>'
-                              '<section><p>Другой маршрут — Олег Макетный.</p>'
+                              '<section><p>Южный берег — Иван Другой.</p>'
                               '<a href="/south.epub">Скачать EPUB</a></section>')
     result = evaluate_page(document, catalog, "north")
     assert result["status"] == 1

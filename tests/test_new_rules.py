@@ -9,7 +9,7 @@ from part2 import Book, evaluate_page, analyze_url
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
-CATALOG = [Book("north", "Лада Макетова", "Учебный маршрут. Том 1", "ebook")]
+CATALOG = [Book("north", "Анна Лесная", "Учебный маршрут. Том 1", "ebook")]
 
 
 @pytest.fixture(autouse=True)
@@ -20,7 +20,7 @@ def no_requests(monkeypatch):
 
 def document(content, url="https://example.org/book"):
     html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1</title></head>'
-            '<body><main><h1>Учебный маршрут. Том 1</h1><p class="book-author">Лада Макетова</p>'
+            '<body><main><h1>Учебный маршрут. Том 1</h1><p class="book-author">Анна Лесная</p>'
             '<p>Карточка первого тома с информацией об авторе и доступных вариантах чтения.</p>'
             + content + '</main></body></html>')
     return FetchResult(url, url, 200, {"Content-Type": "text/html; charset=utf-8"}, html.encode())
@@ -41,7 +41,7 @@ def test_scoped_reading_and_extensionless_downloads_are_signs(content, kind):
 @pytest.mark.parametrize("content", [
     '<a href="/offer">Скачать</a>',
     '<div class="advertisement"><a href="/download/book">Скачать книгу</a></div>',
-    '<section><h2>Другой маршрут</h2><a href="/read/south">Читать онлайн</a></section>',
+    '<section><h2>Южный берег</h2><a href="/read/south">Читать онлайн</a></section>',
     '<a href="/read/book">Хочу прочитать</a>',
     '<a href="#">Скачать книгу</a>',
 ])
@@ -59,7 +59,7 @@ def test_explicitly_different_book_identifier_is_not_inherited():
 
 def test_collection_requires_explicit_listed_membership_not_a_prose_mention():
     html = (FIXTURES / "collection.html").read_text(encoding="utf-8")
-    html = html.replace('<ul><li>Учебный маршрут. Том 1</li><li>Другой маршрут</li></ul>',
+    html = html.replace('<ul><li>Учебный маршрут. Том 1</li><li>Южный берег</li></ul>',
                         '<p>Возможно, вас заинтересует Учебный маршрут. Том 1.</p>')
     result = evaluate_page(FetchResult("https://example.org/collection", "https://example.org/collection",
                                       200, {"Content-Type": "text/html; charset=utf-8"}, html.encode()), CATALOG, "north")
@@ -184,8 +184,8 @@ def test_article_paragraph_with_download_counter_keeps_its_action():
 
 
 def test_paired_book_author_headings_and_semantic_reader_are_supported():
-    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Лада Макетова - читать онлайн</title></head>'
-            '<body><h1>Учебный маршрут. Том 1</h1><div><h2>Учебный маршрут. Том 1</h2><h2>Лада Макетова</h2>'
+    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Анна Лесная - читать онлайн</title></head>'
+            '<body><h1>Учебный маршрут. Том 1</h1><div><h2>Учебный маршрут. Том 1</h2><h2>Анна Лесная</h2>'
             '<select><option>Arial</option><option>Georgia</option></select>'
             '<div class="block_read_text">' + '<p>Учебный текст путешествия по северной дороге.</p>' * 40
             + '</div></div></body></html>')
@@ -198,7 +198,7 @@ def test_paired_book_author_headings_and_semantic_reader_are_supported():
 def test_collection_download_heading_is_not_confused_with_bold_link_labels():
     html = (FIXTURES / "collection.html").read_text(encoding="utf-8").replace(
         '<a href="/files/collection.zip">Скачать сборник ZIP</a>',
-        '<b>Скачать Лада Макетова. Сборник книг</b><div>'
+        '<b>Скачать Анна Лесная. Сборник книг</b><div>'
         '<a href="https://files.example/opaque"><b>Скачать Host</b></a>'
         '<a href="https://files.example/collection.zip"><b>Скачать Host2</b></a></div>')
     result = evaluate_page(FetchResult("https://example.org/collection", "https://example.org/collection", 200,
@@ -207,7 +207,7 @@ def test_collection_download_heading_is_not_confused_with_bold_link_labels():
 
 
 def test_explicit_bibliographic_context_identifies_its_download_group():
-    html = ('<div class="entry-content"><p>Учебный маршрут. Том 1<br>Автор: Лада Макетова<br>Год: 2026</p>'
+    html = ('<div class="entry-content"><p>Учебный маршрут. Том 1<br>Автор: Анна Лесная<br>Год: 2026</p>'
             '<p>История о путешествии по северной дороге.'
             '<a href="/index.php?do=download&amp;id=7124">Скачать .torrent</a></p></div>')
     assert evaluate_page(document(html), CATALOG, "north")["status"] == 1
@@ -236,9 +236,9 @@ def test_font_controls_inside_reader_are_not_another_book_heading():
 
 
 def test_semantic_metadata_card_can_identify_its_sibling_legacy_reader():
-    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Лада Макетова - читать онлайн</title></head>'
+    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Анна Лесная - читать онлайн</title></head>'
             '<body><h1>Учебный маршрут. Том 1</h1><div class="center_col">'
-            '<div itemscope itemtype="https://schema.org/Book"><h2>Учебный маршрут. Том 1</h2><h2>Лада Макетова</h2></div>'
+            '<div itemscope itemtype="https://schema.org/Book"><h2>Учебный маршрут. Том 1</h2><h2>Анна Лесная</h2></div>'
             '<div class="block_read_text"><h3>Шрифт:</h3><select><option>Arial</option></select>'
             + '<p>Учебный текст путешествия по северной дороге.</p>' * 40 + '</div></div></body></html>')
     result = evaluate_page(FetchResult("https://example.org/read/book", "https://example.org/read/book", 200,
@@ -248,10 +248,10 @@ def test_semantic_metadata_card_can_identify_its_sibling_legacy_reader():
 
 
 def test_verified_reader_scope_is_not_replaced_by_an_outer_sibling_heading():
-    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Лада Макетова - читать онлайн</title></head>'
+    html = ('<html><head><meta charset="utf-8"><title>Учебный маршрут. Том 1, Анна Лесная - читать онлайн</title></head>'
             '<body><h1>Учебный маршрут. Том 1</h1><div class="layout">'
-            '<div><h2>Другой маршрут</h2></div><div class="reading-column">'
-            '<div itemscope itemtype="https://schema.org/Book"><h2>Учебный маршрут. Том 1</h2><h2>Лада Макетова</h2></div>'
+            '<div><h2>Южный берег</h2></div><div class="reading-column">'
+            '<div itemscope itemtype="https://schema.org/Book"><h2>Учебный маршрут. Том 1</h2><h2>Анна Лесная</h2></div>'
             '<div class="block_read_text"><h3>Шрифт:</h3>'
             + '<p>Учебный текст путешествия по северной дороге.</p>' * 40 + '</div></div></div></body></html>')
     result = evaluate_page(FetchResult("https://example.org/book", "https://example.org/book", 200,

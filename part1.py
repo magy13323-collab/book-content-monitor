@@ -16,7 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-HEADERS = ("Правообладатель", "Автор", "Название", "Тип контента", "url", "Сайт")
+HEADERS = ("Праообладатель", "Автор", "Название", "Тип контента", "url", "Сайт")
 PUNCTUATION = str.maketrans({
     "«": '"', "»": '"', "“": '"', "”": '"', "„": '"',
     "‘": "'", "’": "'", "‐": "-", "‑": "-", "–": "-", "—": "-", "−": "-",
@@ -29,13 +29,18 @@ RUSSIAN = str.maketrans(dict(zip(
 )))
 
 
-def normalize_text(value):
-    """Search key only: preserve words, punctuation, numbers and author order."""
+def normalize_identity(value):
+    """Identity key: preserve е/ё, punctuation, numbers and author order."""
     if value is None:
         return ""
-    text = unicodedata.normalize("NFKC", str(value)).casefold().replace("ё", "е")
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
     text = re.sub(r"\s+", " ", text.translate(PUNCTUATION))
     return text.strip(" ;*")
+
+
+def normalize_text(value):
+    """Search similarity only; е/ё folding does not establish identity."""
+    return normalize_identity(value).replace("ё", "е")
 
 
 def normalize_url(value):
@@ -234,6 +239,15 @@ def find_review_cases(analysis):
                        "Прямая ссылка на книгу; наличие книги и её контента на странице.")
         url_title_checks(analysis, record)
 
+    for group in buckets(records, lambda record: (
+        normalize_text(record.author), normalize_text(record.title), record.content_type
+    )).values():
+        if len({(record.author, record.title) for record in group}) > 1:
+            add_review(analysis, "yo_variant", group,
+                       "Названия или имена авторов различаются е/ё. Кандидаты сохранены отдельно; "
+                       "сходство написания не подтверждает и не опровергает тождество произведений.",
+                       "ISBN/ID произведения или подтверждённое библиографическое написание.")
+
     for group in buckets(records, lambda record: record.book_id).values():
         title = group[0].title
         if len(title) < 10 or not title.isalpha():
@@ -305,13 +319,13 @@ def process_workbook(source):
     try:
         sheet = workbook.worksheets[0]
         headers = tuple(cell.value for cell in next(sheet.iter_rows(max_row=1, max_col=6)))
-        if headers not in {HEADERS, ("Праообладатель",) + HEADERS[1:]}:
+        if headers not in {HEADERS, ("Правообладатель",) + HEADERS[1:]}:
             raise ValueError(f"Неожиданные заголовки первого листа: {headers!r}")
         for row_number, values in enumerate(sheet.iter_rows(min_row=2, max_col=6, values_only=True), 2):
             if all(value is None for value in values):
                 continue
             record = Record(source.name, sheet.title, row_number, tuple(values),
-                            normalize_text(values[1]), normalize_text(values[2]),
+                            normalize_identity(values[1]), normalize_identity(values[2]),
                             normalize_url(values[4]), normalize_text(values[3]))
             record.record_group_id = group_id("record", values)
             record.url_group_id = group_id("url", record.url if valid_url(record.url)

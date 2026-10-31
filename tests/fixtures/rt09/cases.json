@@ -1,0 +1,20 @@
+[
+  {
+    "id": "json_conflict_in_removed_review",
+    "expected_statuses": [
+      1
+    ]
+  },
+  {
+    "id": "json_conflict_in_removed_review_scoped",
+    "expected_statuses": [
+      1
+    ]
+  },
+  {
+    "id": "own_file_positive",
+    "expected_statuses": [
+      1
+    ]
+  }
+]
